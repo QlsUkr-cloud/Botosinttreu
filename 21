@@ -1,0 +1,723 @@
+import asyncio
+import logging
+import os
+import re
+import json
+import secrets
+import csv
+import glob
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+import phonenumbers
+from phonenumbers import carrier, geocoder
+import aiohttp
+import urllib.parse
+
+# =============== ЗАГРУЗКА ТОКЕНОВ ===============
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OWNER_ID = int(os.getenv("OWNER_ID", "8640510286"))
+
+if not BOT_TOKEN or not OPENAI_API_KEY:
+    print("❌ ОШИБКА: Проверь .env файл!")
+    exit(1)
+
+print("✅ Токены загружены успешно!")
+
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# =============== НАЛАШТУВАННЯ ===============
+DATABASES_DIR = "database"
+
+if not os.path.exists(DATABASES_DIR):
+    os.makedirs(DATABASES_DIR)
+    print(f"📁 Створено папку: {DATABASES_DIR}")
+
+# =============== ФАЙЛЫ ДЛЯ ХРАНЕНИЯ ===============
+WHITELIST_FILE = "whitelist.json"
+PROMOCODES_FILE = "promocodes.json"
+
+def load_whitelist():
+    if os.path.exists(WHITELIST_FILE):
+        with open(WHITELIST_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_whitelist(whitelist):
+    with open(WHITELIST_FILE, "w", encoding='utf-8') as f:
+        json.dump(whitelist, f, indent=2, ensure_ascii=False)
+
+def load_promocodes():
+    if os.path.exists(PROMOCODES_FILE):
+        with open(PROMOCODES_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    promocodes = {}
+    for i in range(30):
+        code = secrets.token_hex(5).upper()
+        promocodes[code] = {"used": False, "used_by": None, "user_data": None}
+    save_promocodes(promocodes)
+    return promocodes
+
+def save_promocodes(promocodes):
+    with open(PROMOCODES_FILE, "w", encoding='utf-8') as f:
+        json.dump(promocodes, f, indent=2, ensure_ascii=False)
+
+whitelist = load_whitelist()
+promocodes = load_promocodes()
+
+def is_whitelisted(username=None, phone=None, user_id=None):
+    for entry in whitelist.values():
+        if username and entry.get("username") == username:
+            return True
+        if phone and entry.get("phone") == phone:
+            return True
+        if user_id and entry.get("user_id") == user_id:
+            return True
+    return False
+
+def add_to_whitelist(user_id, username, phone, promo_code):
+    whitelist[str(user_id)] = {
+        "user_id": user_id,
+        "username": username,
+        "phone": phone,
+        "added_at": datetime.now().isoformat(),
+        "promo_code": promo_code
+    }
+    save_whitelist(whitelist)
+
+# =============== КЛАС ДЛЯ ПОШУКУ ===============
+class DatabaseSearcher:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.databases_info = {}
+        self.loaded = False
+        self.all_data = []
+    
+    def scan_databases(self):
+        if not os.path.exists(self.db_path):
+            os.makedirs(self.db_path)
+            return {}
+        
+        databases = {}
+        files = []
+        
+        for ext in ['*.csv', '*.txt', '*.xlsx']:
+            files.extend(glob.glob(os.path.join(self.db_path, ext)))
+        
+        for file_path in files:
+            file_name = os.path.basename(file_path)
+            try:
+                file_size = os.path.getsize(file_path)
+                size_mb = file_size / (1024 * 1024)
+                
+                databases[file_name] = {
+                    'path': file_path,
+                    'size_mb': round(size_mb, 2),
+                    'type': file_path.split('.')[-1]
+                }
+                print(f"📁 Знайдено: {file_name}")
+            except Exception as e:
+                print(f"❌ Помилка: {e}")
+        
+        self.databases_info = databases
+        self.loaded = True
+        return databases
+    
+    def load_all_data(self):
+        if not self.loaded:
+            self.scan_databases()
+        
+        self.all_data = []
+        
+        for name, info in self.databases_info.items():
+            try:
+                with open(info['path'], 'r', encoding='utf-8', errors='ignore') as f:
+                    sample = f.read(1024)
+                    f.seek(0)
+                    delimiter = ';' if ';' in sample else ','
+                    reader = csv.reader(f, delimiter=delimiter)
+                    
+                    for row in reader:
+                        if row and len(row) > 0:
+                            self.all_data.append(row)
+                print(f"✅ Завантажено: {name}")
+            except Exception as e:
+                print(f"❌ Помилка {name}: {e}")
+        
+        return self.all_data
+    
+    def search_phone(self, phone_number):
+        if not self.all_data:
+            self.load_all_data()
+        
+        phone_clean = re.sub(r'\D', '', phone_number)
+        results = []
+        
+        for row in self.all_data:
+            row_text = " ".join(row)
+            row_clean = re.sub(r'\D', '', row_text)
+            
+            if phone_clean in row_clean or row_clean.endswith(phone_clean[-7:]):
+                results.append(row)
+        
+        # Видаляємо дублікати
+        unique_results = []
+        for r in results:
+            if r not in unique_results:
+                unique_results.append(r)
+        
+        return unique_results
+    
+    def search_name(self, name_query):
+        if not self.all_data:
+            self.load_all_data()
+        
+        name_lower = name_query.lower()
+        results = []
+        
+        for row in self.all_data:
+            row_text = " ".join(row).lower()
+            if name_lower in row_text:
+                results.append(row)
+        
+        unique_results = []
+        for r in results:
+            if r not in unique_results:
+                unique_results.append(r)
+        
+        return unique_results
+
+db_searcher = DatabaseSearcher(DATABASES_DIR)
+
+# =============== СОСТОЯНИЯ ===============
+class InputStates(StatesGroup):
+    waiting_username = State()
+    waiting_phone = State()
+    waiting_factcheck = State()
+    waiting_iin = State()
+    waiting_dork_query = State()
+    waiting_webarchive = State()
+    waiting_promocode = State()
+    waiting_complex = State()
+    waiting_simple_search = State()   # Простий пошук
+    waiting_extended_search = State() # Розширений пошук
+    waiting_name_search = State()
+
+# =============== КЛАВИАТУРЫ ===============
+def main_menu():
+    buttons = [
+        [InlineKeyboardButton(text="🔍 Простий пошук (номер)", callback_data="simple_search")],
+        [InlineKeyboardButton(text="📊 Розширений пошук (номер)", callback_data="extended_search")],
+        [InlineKeyboardButton(text="👤 Пошук по ФІО", callback_data="search_name")],
+        [InlineKeyboardButton(text="📞 Аналіз номера", callback_data="phone")],
+        [InlineKeyboardButton(text="✅ Перевірка фактів", callback_data="factcheck")],
+        [InlineKeyboardButton(text="🆔 Аналіз ІНН", callback_data="iin")],
+        [InlineKeyboardButton(text="🔎 Google Dork", callback_data="dork_menu")],
+        [InlineKeyboardButton(text="📁 WebArchive", callback_data="webarchive")],
+        [InlineKeyboardButton(text="🔐 Активація промокоду", callback_data="activate_promo")],
+        [InlineKeyboardButton(text="ℹ️ Інфо про бота", callback_data="info")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def dork_menu():
+    buttons = [
+        [InlineKeyboardButton(text="👤 Пошук людини", callback_data="dork_person")],
+        [InlineKeyboardButton(text="📧 Пошук email", callback_data="dork_email")],
+        [InlineKeyboardButton(text="📂 Документи", callback_data="dork_docs")],
+        [InlineKeyboardButton(text="💀 Адмінки", callback_data="dork_admin")],
+        [InlineKeyboardButton(text="🔐 Секретні файли", callback_data="dork_secret")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# =============== ФОРМАТУВАННЯ РЕЗУЛЬТАТІВ ===============
+def format_simple_result(row):
+    """Простий формат - тільки чи є в базі"""
+    return "✅ **Знайдено в базі даних!**"
+
+def format_extended_result(row):
+    """Розширений формат - вся інформація"""
+    if not row:
+        return None
+    
+    result = "📋 **Розширена інформація:**\n\n"
+    
+    # Розпізнаємо телефон
+    phone_pattern = r'[+]?\d{10,12}'
+    for cell in row:
+        cell_str = str(cell).strip()
+        if not cell_str:
+            continue
+        if re.match(phone_pattern, cell_str):
+            result += f"📞 **Телефон:** `{cell_str}`\n"
+            break
+    
+    # Шукаємо ФІО
+    name_pattern = r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)?'
+    for cell in row:
+        cell_str = str(cell).strip()
+        if re.match(name_pattern, cell_str):
+            result += f"👤 **ПІБ:** {cell_str}\n"
+            break
+    
+    # Шукаємо регіон
+    region_pattern = r'[А-ЯЁ][а-яё]+(?:[-\s][А-ЯЁ][а-яё]+)?(?:AO|край|область|район)'
+    for cell in row:
+        cell_str = str(cell).strip()
+        if re.search(region_pattern, cell_str, re.IGNORECASE):
+            result += f"📍 **Регіон:** {cell_str}\n"
+            break
+    
+    # Шукаємо дату
+    date_pattern = r'\d{2}[./]\d{2}[./]\d{4}'
+    for cell in row:
+        cell_str = str(cell).strip()
+        if re.match(date_pattern, cell_str):
+            result += f"📅 **Дата:** {cell_str}\n"
+            break
+    
+    # Додаткова інформація
+    other_info = []
+    for cell in row:
+        cell_str = str(cell).strip()
+        if cell_str and not any(x in result for x in cell_str):
+            if len(cell_str) < 50 and not re.match(phone_pattern, cell_str):
+                other_info.append(cell_str)
+    
+    if other_info:
+        result += f"ℹ️ **Додатково:** {', '.join(other_info[:3])}\n"
+    
+    return result
+
+# =============== ОБРОБНИК /start ===============
+@dp.message(Command("start"))
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "🤖 **OSINT Power Bot v9.0**\n\n"
+        "🔍 **Простий пошук** - перевіряє чи є номер в базі\n"
+        "📊 **Розширений пошук** - показує всю інформацію\n"
+        "👤 **Пошук по ФІО** - знаходить за іменем\n\n"
+        "Оберіть режим пошуку 👇",
+        reply_markup=main_menu(),
+        parse_mode="Markdown"
+    )
+
+# =============== КОМАНДИ ДЛЯ ВЛАСНИКА ===============
+@dp.message(Command("load_databases"))
+async def load_databases_cmd(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("❌ Доступ заборонено.")
+        return
+    
+    await message.answer("🔄 **Завантаження баз даних...**", parse_mode="Markdown")
+    db_searcher.scan_databases()
+    db_searcher.load_all_data()
+    
+    await message.answer(
+        f"✅ **Завантажено {len(db_searcher.all_data)} записів**\n"
+        f"📁 З {len(db_searcher.databases_info)} файлів",
+        parse_mode="Markdown"
+    )
+
+# =============== ПРОСТИЙ ПОШУК (тільки перевірка) ===============
+@dp.callback_query(lambda c: c.data == "simple_search")
+async def simple_search_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🔍 **Простий пошук**\n\n"
+        "Введіть номер телефону:\n"
+        "Приклад: `79222809644` або `+79222809644`\n\n"
+        "ℹ️ Бот просто перевірить чи є номер в базі",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_simple_search)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_simple_search)
+async def simple_search(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    phone_clean = re.sub(r'\D', '', phone)
+    
+    if len(phone_clean) < 7:
+        await message.answer("❌ Введіть коректний номер (мінімум 7 цифр)")
+        return
+    
+    await message.answer(f"🔍 **Перевіряю номер `{phone}`...**", parse_mode="Markdown")
+    
+    results = await asyncio.to_thread(db_searcher.search_phone, phone)
+    
+    if not results:
+        await message.answer(
+            f"❌ **Номер `{phone}` НЕ знайдено в базах даних**\n\n"
+            f"📊 Перевірено {len(db_searcher.all_data)} записів",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            f"✅ **Номер `{phone}` ЗНАЙДЕНО в базі даних!**\n\n"
+            f"📊 Всього збігів: {len(results)}\n\n"
+            f"💡 Для детальної інформації використайте 'Розширений пошук'",
+            parse_mode="Markdown"
+        )
+    
+    await state.clear()
+    await message.answer("Що далі?", reply_markup=main_menu())
+
+# =============== РОЗШИРЕНИЙ ПОШУК (вся інформація) ===============
+@dp.callback_query(lambda c: c.data == "extended_search")
+async def extended_search_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📊 **Розширений пошук**\n\n"
+        "Введіть номер телефону:\n"
+        "Приклад: `79222809644` або `+79222809644`\n\n"
+        "ℹ️ Бот покаже всю доступну інформацію",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_extended_search)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_extended_search)
+async def extended_search(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    phone_clean = re.sub(r'\D', '', phone)
+    
+    if len(phone_clean) < 7:
+        await message.answer("❌ Введіть коректний номер (мінімум 7 цифр)")
+        return
+    
+    await message.answer(f"🔍 **Шукаю `{phone}`...**\n\n⏳ Перевіряю бази даних...", parse_mode="Markdown")
+    
+    results = await asyncio.to_thread(db_searcher.search_phone, phone)
+    
+    if not results:
+        await message.answer(
+            f"❌ **Нічого не знайдено** для номера `{phone}`\n\n"
+            f"📊 Перевірено {len(db_searcher.all_data)} записів",
+            parse_mode="Markdown"
+        )
+    else:
+        for row in results[:5]:
+            formatted = format_extended_result(row)
+            if formatted:
+                await message.answer(formatted, parse_mode="Markdown")
+        
+        if len(results) > 5:
+            await message.answer(f"📊 *Показано 5 з {len(results)} результатів*", parse_mode="Markdown")
+    
+    await state.clear()
+    await message.answer("Що далі?", reply_markup=main_menu())
+
+# =============== ПОШУК ПО ФІО ===============
+@dp.callback_query(lambda c: c.data == "search_name")
+async def search_name_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "👤 **Пошук по ФІО**\n\n"
+        "Введіть прізвище, ім'я або повне ФІО:\n"
+        "Приклади: `Айнур` або `Акдасович`\n\n"
+        "ℹ️ Бот знайде всі збіги в базах",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_name_search)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_name_search)
+async def search_by_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    
+    if len(name) < 3:
+        await message.answer("❌ Введіть мінімум 3 символи для пошуку")
+        return
+    
+    await message.answer(f"🔍 **Шукаю `{name}`...**\n\n⏳ Перевіряю бази даних...", parse_mode="Markdown")
+    
+    results = await asyncio.to_thread(db_searcher.search_name, name)
+    
+    if not results:
+        await message.answer(
+            f"❌ **Нічого не знайдено** для запиту `{name}`\n\n"
+            f"📊 Перевірено {len(db_searcher.all_data)} записів",
+            parse_mode="Markdown"
+        )
+    else:
+        for row in results[:10]:
+            formatted = format_extended_result(row)
+            if formatted:
+                await message.answer(formatted, parse_mode="Markdown")
+        
+        if len(results) > 10:
+            await message.answer(f"📊 *Показано 10 з {len(results)} результатів*", parse_mode="Markdown")
+    
+    await state.clear()
+    await message.answer("Що далі?", reply_markup=main_menu())
+
+# =============== АНАЛІЗ НОМЕРА ===============
+@dp.callback_query(lambda c: c.data == "phone")
+async def phone_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📊 **Аналіз номера телефону**\n\nВведіть номер у міжнародному форматі:\nПриклад: `+79222809644`",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_phone)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_phone)
+async def phone_analysis(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    
+    try:
+        parsed = phonenumbers.parse(phone, None)
+        if not phonenumbers.is_valid_number(parsed):
+            await message.answer("❌ Невірний формат номера")
+            await state.clear()
+            await message.answer("Що далі?", reply_markup=main_menu())
+            return
+        
+        country = geocoder.description_for_number(parsed, "ru")
+        operator = carrier.name_for_number(parsed, "ru")
+        
+        result = f"📊 **Аналіз номера**\n\n"
+        result += f"📞 **Номер:** `{phone}`\n"
+        result += f"🌍 **Країна:** {country}\n"
+        result += f"📡 **Оператор:** {operator if operator else 'Не визначено'}\n"
+        result += f"✅ **Статус:** Валідний"
+        
+        await message.answer(result, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"❌ Помилка: {str(e)[:100]}")
+    
+    await state.clear()
+    await message.answer("Що далі?", reply_markup=main_menu())
+
+# =============== ПЕРЕВІРКА ФАКТІВ ===============
+@dp.callback_query(lambda c: c.data == "factcheck")
+async def factcheck_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "✅ **Перевірка фактів**\n\nНадішліть текст для аналізу:",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_factcheck)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_factcheck)
+async def factcheck_analysis(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if len(text) < 10:
+        await message.answer("❌ Занадто короткий текст")
+        return
+    
+    await message.answer("🧠 Аналізую...")
+    
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ти експерт з перевірки фактів. Відповідай коротко українською."},
+                {"role": "user", "content": text}
+            ]
+        )
+        await message.answer(f"✅ **Результат:**\n\n{response.choices[0].message.content}", parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"❌ Помилка: {str(e)[:100]}")
+    
+    await state.clear()
+    await message.answer("Що далі?", reply_markup=main_menu())
+
+# =============== АНАЛІЗ ІНН ===============
+@dp.callback_query(lambda c: c.data == "iin")
+async def iin_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🆔 **Аналіз ІНН**\n\nВведіть ІНН/ІІН/СНІЛС:\n🇰🇿 Казахстан: 12 цифр\n🇷🇺 Росія: 11 цифр\n🇺🇦 Україна: 10 цифр\n🇧🇾 Білорусь: 9 цифр",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_iin)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_iin)
+async def iin_analysis(message: types.Message, state: FSMContext):
+    iin = message.text.strip().replace(" ", "").replace("-", "")
+    
+    if re.match(r'^\d{12}$', iin):
+        year = 1900 + int(iin[0:2]) if int(iin[6]) in [3,4] else 2000 + int(iin[0:2])
+        gender = "Чоловіча" if int(iin[6]) % 2 == 1 else "Жіноча"
+        result = f"🇰🇿 **ІІН Казахстан**\n📅 Дата: {iin[4:6]}.{iin[2:4]}.{year}\n👤 Стать: {gender}"
+    elif re.match(r'^\d{11}$', iin):
+        result = f"🇷🇺 **СНІЛС Росія**\n📋 Номер: {iin[:3]}-{iin[3:6]}-{iin[6:9]} {iin[9:11]}"
+    elif re.match(r'^\d{10}$', iin):
+        result = f"🇺🇦 **ІНН Україна**\n📋 Код: {iin}"
+    elif re.match(r'^\d{9}$', iin):
+        result = f"🇧🇾 **УНП Білорусь**\n📋 Номер: {iin[:2]}-{iin[2:5]}-{iin[5:9]}"
+    else:
+        result = "❌ Невірний формат"
+    
+    await message.answer(result, parse_mode="Markdown")
+    await state.clear()
+    await message.answer("Що далі?", reply_markup=main_menu())
+
+# =============== GOOGLE DORK ===============
+@dp.callback_query(lambda c: c.data == "dork_menu")
+async def dork_menu_handler(callback: types.CallbackQuery):
+    await callback.message.edit_text("🔎 **Google Dork**\nВиберіть тип пошуку:", reply_markup=dork_menu(), parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("dork_") and c.data != "dork_menu" and c.data != "back_to_main")
+async def dork_type_handler(callback: types.CallbackQuery, state: FSMContext):
+    dork_type = callback.data.split("_")[1]
+    await state.update_data(dork_type=dork_type)
+    
+    prompts = {
+        "person": "👤 Введіть username для пошуку:",
+        "email": "📧 Введіть email або домен:",
+        "docs": "📂 Введіть ключове слово:",
+        "admin": "💀 Введіть сайт:",
+        "secret": "🔐 Введіть сайт:"
+    }
+    
+    await callback.message.edit_text(prompts.get(dork_type, "Введіть запит:"), parse_mode="Markdown")
+    await state.set_state(InputStates.waiting_dork_query)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_dork_query)
+async def process_dork(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    user_data = await state.get_data()
+    dork_type = user_data.get("dork_type", "person")
+    
+    templates = {
+        "person": [f'"{query}" site:instagram.com', f'"{query}" site:t.me'],
+        "email": [f'"{query}" filetype:pdf', f'"{query}" site:pastebin.com'],
+        "docs": [f'filetype:pdf "{query}"', f'filetype:xls "{query}"'],
+        "admin": [f'site:{query} inurl:admin', f'site:{query} inurl:login'],
+        "secret": [f'site:{query} filetype:env', f'site:{query} filetype:json']
+    }
+    
+    dorks = templates.get(dork_type, [])
+    result_text = f"🔎 **Google Dork для `{query}`**\n\n" + "\n".join([f"• `{d}`" for d in dorks])
+    
+    await message.answer(result_text[:4000], parse_mode="Markdown")
+    await state.clear()
+    await message.answer("Що далі?", reply_markup=main_menu())
+
+# =============== WEBARCHIVE ===============
+@dp.callback_query(lambda c: c.data == "webarchive")
+async def webarchive_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📁 **WebArchive**\n\nВведіть URL сайту:\nПриклад: `https://example.com`",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_webarchive)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_webarchive)
+async def webarchive_check(message: types.Message, state: FSMContext):
+    url = message.text.strip()
+    await message.answer("📁 Шукаю архівні копії...")
+    
+    try:
+        encoded_url = urllib.parse.quote(url, safe='')
+        archive_url = f"https://archive.org/wayback/available?url={encoded_url}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(archive_url, timeout=15) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("archived_snapshots"):
+                        snapshot = data["archived_snapshots"]["closest"]
+                        archive_url_full = snapshot.get("url", "немає посилання")
+                        await message.answer(f"📁 **Архівна копія:** [Відкрити]({archive_url_full})", parse_mode="Markdown")
+                    else:
+                        await message.answer(f"❌ Архівних копій не знайдено.", parse_mode="Markdown")
+                else:
+                    await message.answer(f"❌ Помилка при зверненні до архіву.", parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"❌ Помилка: {str(e)[:100]}", parse_mode="Markdown")
+    
+    await state.clear()
+    await message.answer("Що далі?", reply_markup=main_menu())
+
+# =============== АКТИВАЦІЯ ПРОМОКОДУ ===============
+@dp.callback_query(lambda c: c.data == "activate_promo")
+async def activate_promo_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🔐 **Активація промокоду**\n\nВведіть промокод:",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_promocode)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_promocode)
+async def process_promocode(message: types.Message, state: FSMContext):
+    code = message.text.strip().upper()
+    user_id = message.from_user.id
+    username = message.from_user.username
+    
+    if code not in promocodes:
+        await message.answer("❌ Невірний промокод.")
+        return
+    
+    if promocodes[code]["used"]:
+        await message.answer("❌ Промокод вже використаний.")
+        return
+    
+    add_to_whitelist(user_id, username, None, code)
+    promocodes[code]["used"] = True
+    promocodes[code]["used_by"] = user_id
+    save_promocodes(promocodes)
+    
+    await message.answer("✅ **Тебе додано в білий список!**")
+    await state.clear()
+
+# =============== ІНФО ===============
+@dp.callback_query(lambda c: c.data == "info")
+async def bot_info(callback: types.CallbackQuery):
+    info_text = (
+        "🤖 **OSINT Power Bot v9.0**\n\n"
+        "**Режими пошуку:**\n"
+        "🔍 Простий пошук - перевіряє наявність номера\n"
+        "📊 Розширений пошук - показує всю інформацію\n"
+        "👤 Пошук по ФІО - знаходить за іменем\n\n"
+        f"📊 **Завантажено записів:** {len(db_searcher.all_data)}\n"
+        f"📁 **Файлів баз:** {len(db_searcher.databases_info)}\n\n"
+        "**Команди:**\n"
+        "/start - Головне меню\n"
+        "/load_databases - Перезавантажити бази\n\n"
+        "⚠️ Дані з відкритих джерел"
+    )
+    await callback.message.edit_text(info_text, parse_mode="Markdown", reply_markup=main_menu())
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("🤖 **Головне меню**", reply_markup=main_menu(), parse_mode="Markdown")
+    await callback.answer()
+
+# =============== ЗАПУСК ===============
+async def main():
+    print("=" * 50)
+    print("🤖 OSINT Power Bot v9.0")
+    print("=" * 50)
+    print(f"📁 Папка з базами: {os.path.abspath(DATABASES_DIR)}")
+    
+    db_searcher.scan_databases()
+    db_searcher.load_all_data()
+    
+    print(f"📊 Завантажено файлів: {len(db_searcher.databases_info)}")
+    print(f"📊 Завантажено записів: {len(db_searcher.all_data)}")
+    print("=" * 50)
+    print("✅ Бот запущено та готовий до роботи!")
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
