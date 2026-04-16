@@ -1,0 +1,731 @@
+import asyncio
+import logging
+import os
+import re
+import json
+import secrets
+import csv
+import glob
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+import phonenumbers
+from phonenumbers import carrier, geocoder
+import aiohttp
+import urllib.parse
+
+# =============== ЗАГРУЗКА ТОКЕНОВ ===============
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OWNER_ID = int(os.getenv("OWNER_ID", "8640510286"))
+
+if not BOT_TOKEN or not OPENAI_API_KEY:
+    print("❌ ОШИБКА: Проверь .env файл!")
+    exit(1)
+
+print("✅ Токены загружены успешно!")
+
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# =============== НАЛАШТУВАННЯ ДЛЯ БАЗ ДАНИХ ===============
+DATABASES_DIR = "database"
+
+if not os.path.exists(DATABASES_DIR):
+    os.makedirs(DATABASES_DIR)
+    print(f"📁 Створено папку: {DATABASES_DIR}")
+
+# =============== ФАЙЛЫ ДЛЯ ХРАНЕНИЯ ===============
+WHITELIST_FILE = "whitelist.json"
+PROMOCODES_FILE = "promocodes.json"
+
+def load_whitelist():
+    if os.path.exists(WHITELIST_FILE):
+        with open(WHITELIST_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_whitelist(whitelist):
+    with open(WHITELIST_FILE, "w", encoding='utf-8') as f:
+        json.dump(whitelist, f, indent=2, ensure_ascii=False)
+
+def load_promocodes():
+    if os.path.exists(PROMOCODES_FILE):
+        with open(PROMOCODES_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    promocodes = {}
+    for i in range(30):
+        code = secrets.token_hex(5).upper()
+        promocodes[code] = {"used": False, "used_by": None, "user_data": None}
+    save_promocodes(promocodes)
+    return promocodes
+
+def save_promocodes(promocodes):
+    with open(PROMOCODES_FILE, "w", encoding='utf-8') as f:
+        json.dump(promocodes, f, indent=2, ensure_ascii=False)
+
+whitelist = load_whitelist()
+promocodes = load_promocodes()
+
+# =============== ПРОВЕРКА БЕЛОГО СПИСКА ===============
+def is_whitelisted(username=None, phone=None, user_id=None):
+    for entry in whitelist.values():
+        if username and entry.get("username") == username:
+            return True
+        if phone and entry.get("phone") == phone:
+            return True
+        if user_id and entry.get("user_id") == user_id:
+            return True
+    return False
+
+def add_to_whitelist(user_id, username, phone, promo_code):
+    whitelist[str(user_id)] = {
+        "user_id": user_id,
+        "username": username,
+        "phone": phone,
+        "added_at": datetime.now().isoformat(),
+        "promo_code": promo_code
+    }
+    save_whitelist(whitelist)
+
+# =============== КЛАС ДЛЯ ПОШУКУ ПО БАЗАХ ===============
+class DatabaseSearcher:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.databases_info = {}
+        self.loaded = False
+    
+    def scan_databases(self):
+        if not os.path.exists(self.db_path):
+            os.makedirs(self.db_path)
+            return {}
+        
+        databases = {}
+        files = []
+        
+        for ext in ['*.csv', '*.txt', '*.xlsx']:
+            files.extend(glob.glob(os.path.join(self.db_path, ext)))
+        
+        for file_path in files:
+            file_name = os.path.basename(file_path)
+            try:
+                file_size = os.path.getsize(file_path)
+                size_mb = file_size / (1024 * 1024)
+                
+                databases[file_name] = {
+                    'path': file_path,
+                    'size_mb': round(size_mb, 2),
+                    'type': file_path.split('.')[-1]
+                }
+                print(f"📁 Знайдено базу: {file_name} ({size_mb:.2f} МБ)")
+            except Exception as e:
+                print(f"❌ Помилка: {e}")
+        
+        self.databases_info = databases
+        self.loaded = True
+        return databases
+    
+    def search_in_file(self, file_path, query, search_type="phone"):
+        """Пошук в файлі: за номером або за ФІО"""
+        results = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                sample = f.read(1024)
+                f.seek(0)
+                delimiter = ';' if ';' in sample else ','
+                reader = csv.reader(f, delimiter=delimiter)
+                
+                for row_num, row in enumerate(reader):
+                    if row_num > 50000:
+                        break
+                    
+                    row_text = " ".join(row).lower()
+                    
+                    if search_type == "phone":
+                        query_clean = re.sub(r'\D', '', query)
+                        for cell in row:
+                            cell_clean = re.sub(r'\D', '', str(cell))
+                            if query_clean == cell_clean or cell_clean.endswith(query_clean[-7:]):
+                                results.append({
+                                    'row': row_num + 1,
+                                    'full_row': row,
+                                    'data': row
+                                })
+                                if len(results) >= 10:
+                                    return results
+                    else:  # Поиск по ФИО
+                        if query.lower() in row_text:
+                            results.append({
+                                'row': row_num + 1,
+                                'full_row': row,
+                                'data': row
+                            })
+                            if len(results) >= 10:
+                                return results
+        
+        except Exception as e:
+            pass
+        
+        return results
+    
+    def search_phone(self, phone_number):
+        """Пошук номера телефону"""
+        if not self.loaded:
+            self.scan_databases()
+        
+        if not self.databases_info:
+            return None
+        
+        all_results = {}
+        for name, info in self.databases_info.items():
+            results = self.search_in_file(info['path'], phone_number, "phone")
+            if results:
+                all_results[name] = {
+                    'info': info,
+                    'matches': results,
+                    'count': len(results)
+                }
+        
+        return all_results if all_results else None
+    
+    def search_name(self, name):
+        """Пошук за ФІО"""
+        if not self.loaded:
+            self.scan_databases()
+        
+        if not self.databases_info:
+            return None
+        
+        all_results = {}
+        for name_db, info in self.databases_info.items():
+            results = self.search_in_file(info['path'], name, "name")
+            if results:
+                all_results[name_db] = {
+                    'info': info,
+                    'matches': results,
+                    'count': len(results)
+                }
+        
+        return all_results if all_results else None
+
+# =============== СТВОРЮЄМО ПОШУКОВЦЯ ===============
+db_searcher = DatabaseSearcher(DATABASES_DIR)
+
+# =============== СОСТОЯНИЯ ===============
+class InputStates(StatesGroup):
+    waiting_username = State()
+    waiting_phone = State()
+    waiting_factcheck = State()
+    waiting_iin = State()
+    waiting_dork_query = State()
+    waiting_webarchive = State()
+    waiting_promocode = State()
+    waiting_complex = State()
+    waiting_db_search = State()
+    waiting_name_search = State()
+
+# =============== КЛАВИАТУРЫ ===============
+def main_menu():
+    buttons = [
+        [InlineKeyboardButton(text="🔍 Sherlock", callback_data="sherlock")],
+        [InlineKeyboardButton(text="📞 Анализ номера", callback_data="phone")],
+        [InlineKeyboardButton(text="🗄️ Поиск по номеру", callback_data="search_db")],
+        [InlineKeyboardButton(text="👤 Поиск по ФИО", callback_data="search_name")],
+        [InlineKeyboardButton(text="✅ Проверка фактов", callback_data="factcheck")],
+        [InlineKeyboardButton(text="🆔 Анализ ИНН", callback_data="iin")],
+        [InlineKeyboardButton(text="🔎 Google Dork", callback_data="dork_menu")],
+        [InlineKeyboardButton(text="📁 WebArchive", callback_data="webarchive")],
+        [InlineKeyboardButton(text="🔐 Активация промокода", callback_data="activate_promo")],
+        [InlineKeyboardButton(text="📊 Комплексный анализ", callback_data="complex")],
+        [InlineKeyboardButton(text="ℹ️ Инфо о боте", callback_data="info")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def dork_menu():
+    buttons = [
+        [InlineKeyboardButton(text="👤 Поиск человека", callback_data="dork_person")],
+        [InlineKeyboardButton(text="📧 Поиск email", callback_data="dork_email")],
+        [InlineKeyboardButton(text="📂 Документы", callback_data="dork_docs")],
+        [InlineKeyboardButton(text="💀 Админки", callback_data="dork_admin")],
+        [InlineKeyboardButton(text="🔐 Секретные файлы", callback_data="dork_secret")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# =============== ОБРАБОТЧИК КОМАНДЫ /start ===============
+@dp.message(Command("start"))
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "🤖 **OSINT Power Bot v7.0**\n\n"
+        "Я умею:\n"
+        "🔍 Искать профили по username\n"
+        "📞 Анализировать номера телефонов\n"
+        "🗄️ Искать номера в базах данных\n"
+        "👤 Искать людей по ФИО\n"
+        "✅ Проверять факты через ИИ\n"
+        "🆔 Анализировать ИНН 4 стран\n"
+        "🔎 Google Dork\n"
+        "📁 Смотреть архив сайтов\n"
+        "📊 Комплексный анализ\n\n"
+        "Выбери инструмент в меню 👇",
+        reply_markup=main_menu(),
+        parse_mode="Markdown"
+    )
+
+# =============== КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦА ===============
+@dp.message(Command("gen_promocode"))
+async def gen_promocode(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    code = secrets.token_hex(5).upper()
+    promocodes[code] = {"used": False, "used_by": None, "user_data": None}
+    save_promocodes(promocodes)
+    await message.answer(f"✅ Новый промокод: `{code}`", parse_mode="Markdown")
+
+@dp.message(Command("load_databases"))
+async def load_databases_cmd(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    await message.answer("🔄 **Сканирование папки с базами данных...**", parse_mode="Markdown")
+    databases = db_searcher.scan_databases()
+    
+    if databases:
+        total_size = sum(db['size_mb'] for db in databases.values())
+        db_list = "\n".join([f"• `{name}` ({info['size_mb']} МБ)" for name, info in databases.items()])
+        await message.answer(
+            f"✅ **Найдено {len(databases)} баз(ы) данных**\n"
+            f"💾 Общий размер: {round(total_size, 2)} МБ\n\n"
+            f"📋 Список:\n{db_list}",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            f"❌ **Базы данных не найдены!**\n\n"
+            f"Проверь папку: `{DATABASES_DIR}`",
+            parse_mode="Markdown"
+        )
+
+# =============== ПОИСК ПО НОМЕРУ ===============
+@dp.callback_query(lambda c: c.data == "search_db")
+async def search_db_start(callback: types.CallbackQuery, state: FSMContext):
+    databases = db_searcher.scan_databases()
+    
+    if not databases:
+        await callback.message.edit_text(
+            "❌ **Базы данных не найдены!**\n\nНажми /load_databases",
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+    
+    await callback.message.edit_text(
+        "🗄️ **Поиск по номеру телефона**\n\n"
+        "Введи номер телефона:\n"
+        "Форматы: `+380991234567` или `380991234567` или `0991234567`\n\n"
+        f"📁 Доступно баз: {len(databases)}",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_db_search)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_db_search)
+async def search_in_databases(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    phone_clean = re.sub(r'\D', '', phone)
+    
+    if len(phone_clean) < 7:
+        await message.answer("❌ Введи корректный номер (минимум 7 цифр)")
+        return
+    
+    await message.answer(f"🔍 **Ищу `{phone}` в базах данных...**\n\n⏳ Подожди...", parse_mode="Markdown")
+    
+    results = await asyncio.to_thread(db_searcher.search_phone, phone)
+    
+    if not results:
+        await message.answer(
+            f"❌ **Ничего не найдено** для номера `{phone}`\n\n"
+            f"📊 Проверено {len(db_searcher.databases_info)} баз(ы)",
+            parse_mode="Markdown"
+        )
+    else:
+        response = f"🔍 **Результаты поиска для `{phone}`**\n\n"
+        response += f"✅ Найдено в {len(results)} базах:\n\n"
+        
+        for db_name, data in results.items():
+            response += f"📁 **{db_name}** ({data['info']['size_mb']} МБ) - {data['count']} совпадений\n"
+            for i, match in enumerate(data['matches'][:5]):
+                row_data = " | ".join([str(x)[:50] for x in match['full_row']])
+                response += f"  {i+1}. {row_data}\n"
+            response += "\n"
+        
+        response += "\n⚠️ *Данные из открытых источников. Проверяйте достоверность!*"
+        
+        if len(response) > 4000:
+            for i in range(0, len(response), 4000):
+                await message.answer(response[i:i+4000], parse_mode="Markdown")
+        else:
+            await message.answer(response, parse_mode="Markdown")
+    
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=main_menu())
+
+# =============== ПОИСК ПО ФИО (НОВАЯ ФУНКЦИЯ) ===============
+@dp.callback_query(lambda c: c.data == "search_name")
+async def search_name_start(callback: types.CallbackQuery, state: FSMContext):
+    databases = db_searcher.scan_databases()
+    
+    if not databases:
+        await callback.message.edit_text(
+            "❌ **Базы данных не найдены!**\n\nНажми /load_databases",
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+    
+    await callback.message.edit_text(
+        "👤 **Поиск по ФИО**\n\n"
+        "Введи фамилию, имя или полное ФИО для поиска:\n"
+        "Примеры: `Иванов` или `Иван Петров` или `Иванов Иван Иванович`\n\n"
+        f"📁 Доступно баз: {len(databases)}",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_name_search)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_name_search)
+async def search_by_name(message: types.Message, state: FSMContext):
+    name = message.text.strip().lower()
+    
+    if len(name) < 3:
+        await message.answer("❌ Введи минимум 3 символа для поиска")
+        return
+    
+    await message.answer(f"🔍 **Ищу `{name}` в базах данных...**\n\n⏳ Подожди...", parse_mode="Markdown")
+    
+    results = await asyncio.to_thread(db_searcher.search_name, name)
+    
+    if not results:
+        await message.answer(
+            f"❌ **Ничего не найдено** для запроса `{name}`\n\n"
+            f"📊 Проверено {len(db_searcher.databases_info)} баз(ы)",
+            parse_mode="Markdown"
+        )
+    else:
+        response = f"👤 **Результаты поиска для `{name}`**\n\n"
+        response += f"✅ Найдено в {len(results)} базах:\n\n"
+        
+        for db_name, data in results.items():
+            response += f"📁 **{db_name}** ({data['info']['size_mb']} МБ) - {data['count']} совпадений\n"
+            for i, match in enumerate(data['matches'][:5]):
+                row_data = " | ".join([str(x)[:50] for x in match['full_row']])
+                response += f"  {i+1}. {row_data}\n"
+            response += "\n"
+        
+        response += "\n⚠️ *Данные из открытых источников. Проверяйте достоверность!*"
+        
+        if len(response) > 4000:
+            for i in range(0, len(response), 4000):
+                await message.answer(response[i:i+4000], parse_mode="Markdown")
+        else:
+            await message.answer(response, parse_mode="Markdown")
+    
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=main_menu())
+
+# =============== АНАЛИЗ НОМЕРА ===============
+@dp.callback_query(lambda c: c.data == "phone")
+async def phone_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📞 **Анализ номера телефона**\n\nВведи номер в международном формате:\nПример: `+77771234567`",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_phone)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_phone)
+async def phone_analysis(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    
+    await message.answer("📊 Анализирую номер...")
+    
+    try:
+        parsed = phonenumbers.parse(phone, None)
+        if not phonenumbers.is_valid_number(parsed):
+            await message.answer("❌ Неверный формат номера")
+            await state.clear()
+            await message.answer("Что дальше?", reply_markup=main_menu())
+            return
+        
+        country = geocoder.description_for_number(parsed, "ru")
+        operator = carrier.name_for_number(parsed, "ru")
+        formatted_int = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
+        
+        result = f"📞 **Результат анализа номера**\n\n**Номер:** `{formatted_int}`\n**Страна:** {country}\n**Оператор:** {operator if operator else 'Не определен'}\n**Валидность:** ✅ Да"
+        await message.answer(result, parse_mode="Markdown")
+    except:
+        await message.answer("❌ Ошибка при анализе номера")
+    
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=main_menu())
+
+# =============== ПРОВЕРКА ФАКТОВ ===============
+@dp.callback_query(lambda c: c.data == "factcheck")
+async def factcheck_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "✅ **Проверка информации**\n\nОтправь текст для анализа:",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_factcheck)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_factcheck)
+async def factcheck_analysis(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if len(text) < 10:
+        await message.answer("❌ Слишком короткий текст")
+        return
+    
+    await message.answer("🧠 Анализирую...")
+    
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ты эксперт по проверке фактов. Отвечай на русском."},
+                {"role": "user", "content": text}
+            ]
+        )
+        await message.answer(f"✅ **Результат:**\n\n{response.choices[0].message.content}", parse_mode="Markdown")
+    except:
+        await message.answer("❌ Ошибка при анализе")
+    
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=main_menu())
+
+# =============== АНАЛИЗ ИНН ===============
+@dp.callback_query(lambda c: c.data == "iin")
+async def iin_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🆔 **Анализ ИНН**\n\nВведи ИНН/ИИН/СНИЛС:\n🇰🇿 Казахстан: 12 цифр\n🇷🇺 Россия: 11 цифр\n🇺🇦 Украина: 10 цифр\n🇧🇾 Беларусь: 9 цифр",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_iin)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_iin)
+async def iin_analysis(message: types.Message, state: FSMContext):
+    iin = message.text.strip().replace(" ", "").replace("-", "")
+    
+    if re.match(r'^\d{12}$', iin):
+        year = 1900 + int(iin[0:2]) if int(iin[6]) in [3,4] else 2000 + int(iin[0:2])
+        gender = "Мужской" if int(iin[6]) % 2 == 1 else "Женский"
+        result = f"🇰🇿 **ИИН Казахстан**\nДата: {iin[4:6]}.{iin[2:4]}.{year}\nПол: {gender}"
+    elif re.match(r'^\d{11}$', iin):
+        result = f"🇷🇺 **СНИЛС Россия**\nНомер: {iin[:3]}-{iin[3:6]}-{iin[6:9]} {iin[9:11]}"
+    elif re.match(r'^\d{10}$', iin):
+        result = f"🇺🇦 **ИНН Украина**\nКод: {iin}"
+    elif re.match(r'^\d{9}$', iin):
+        result = f"🇧🇾 **УНП Беларусь**\nНомер: {iin[:2]}-{iin[2:5]}-{iin[5:9]}"
+    else:
+        result = "❌ Неверный формат"
+    
+    await message.answer(result, parse_mode="Markdown")
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=main_menu())
+
+# =============== GOOGLE DORK ===============
+@dp.callback_query(lambda c: c.data == "dork_menu")
+async def dork_menu_handler(callback: types.CallbackQuery):
+    await callback.message.edit_text("🔎 **Google Dork**\nВыбери тип поиска:", reply_markup=dork_menu(), parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("dork_") and c.data != "dork_menu" and c.data != "back_to_main")
+async def dork_type_handler(callback: types.CallbackQuery, state: FSMContext):
+    dork_type = callback.data.split("_")[1]
+    await state.update_data(dork_type=dork_type)
+    
+    prompts = {
+        "person": "👤 Введи username для поиска:",
+        "email": "📧 Введи email или домен:",
+        "docs": "📂 Введи ключевое слово:",
+        "admin": "💀 Введи сайт:",
+        "secret": "🔐 Введи сайт:"
+    }
+    
+    await callback.message.edit_text(prompts.get(dork_type, "Введи запрос:"), parse_mode="Markdown")
+    await state.set_state(InputStates.waiting_dork_query)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_dork_query)
+async def process_dork(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    user_data = await state.get_data()
+    dork_type = user_data.get("dork_type", "person")
+    
+    templates = {
+        "person": [f'"{query}" site:instagram.com', f'"{query}" site:t.me', f'"{query}" site:facebook.com'],
+        "email": [f'"{query}" filetype:pdf', f'"{query}" site:pastebin.com'],
+        "docs": [f'filetype:pdf "{query}"', f'filetype:xls "{query}"'],
+        "admin": [f'site:{query} inurl:admin', f'site:{query} inurl:login'],
+        "secret": [f'site:{query} filetype:env', f'site:{query} filetype:json "api"']
+    }
+    
+    dorks = templates.get(dork_type, [])
+    result_text = f"🔎 **Google Dork для `{query}`**\n\n" + "\n".join([f"• `{d}`" for d in dorks])
+    
+    await message.answer(result_text[:4000], parse_mode="Markdown")
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=main_menu())
+
+# =============== WEBARCHIVE ===============
+@dp.callback_query(lambda c: c.data == "webarchive")
+async def webarchive_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📁 **WebArchive**\n\nВведи URL сайта:\nПример: `https://example.com`",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_webarchive)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_webarchive)
+async def webarchive_check(message: types.Message, state: FSMContext):
+    url = message.text.strip()
+    await message.answer("📁 Ищу архивные копии...")
+    
+    try:
+        encoded_url = urllib.parse.quote(url, safe='')
+        archive_url = f"https://archive.org/wayback/available?url={encoded_url}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(archive_url, timeout=15) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("archived_snapshots"):
+                        snapshot = data["archived_snapshots"]["closest"]
+                        archive_url_full = snapshot.get("url", "нет ссылки")
+                        await message.answer(f"📁 **Архивная копия:** [Открыть]({archive_url_full})", parse_mode="Markdown")
+                    else:
+                        await message.answer(f"❌ Архивных копий для `{url}` не найдено.", parse_mode="Markdown")
+                else:
+                    await message.answer(f"❌ Ошибка при обращении к архиву.", parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)[:100]}", parse_mode="Markdown")
+    
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=main_menu())
+
+# =============== КОМПЛЕКСНЫЙ АНАЛИЗ ===============
+@dp.callback_query(lambda c: c.data == "complex")
+async def complex_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "📊 **Комплексный анализ**\n\nВведи данные (username, номер, ИИН, ссылку):",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_complex)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_complex)
+async def complex_analysis(message: types.Message, state: FSMContext):
+    data = message.text.strip()
+    await message.answer("📊 **Начинаю комплексный анализ...**", parse_mode="Markdown")
+    
+    await message.answer("Что дальше?", reply_markup=main_menu())
+    await state.clear()
+
+# =============== ИНФО ===============
+@dp.callback_query(lambda c: c.data == "info")
+async def bot_info(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "🤖 **OSINT Power Bot v7.0**\n\n"
+        "**Новые функции:**\n"
+        "👤 Поиск по ФИО\n"
+        "🗄️ Поиск по номеру с полной информацией\n\n"
+        "**Команды:**\n"
+        "/start - Главное меню\n"
+        "/load_databases - Загрузить базы\n\n"
+        f"📁 Папка с базами: `{DATABASES_DIR}`",
+        parse_mode="Markdown",
+        reply_markup=main_menu()
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("🤖 **Главное меню**", reply_markup=main_menu(), parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "activate_promo")
+async def activate_promo_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🔐 **Активация промокода**\n\nВведи промокод:",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_promocode)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_promocode)
+async def process_promocode(message: types.Message, state: FSMContext):
+    code = message.text.strip().upper()
+    user_id = message.from_user.id
+    username = message.from_user.username
+    
+    if code not in promocodes:
+        await message.answer("❌ Неверный промокод.")
+        return
+    
+    if promocodes[code]["used"]:
+        await message.answer("❌ Промокод уже использован.")
+        return
+    
+    add_to_whitelist(user_id, username, None, code)
+    promocodes[code]["used"] = True
+    promocodes[code]["used_by"] = user_id
+    save_promocodes(promocodes)
+    
+    await message.answer("✅ **Ты добавлен в белый список!**")
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "sherlock")
+async def sherlock_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "🔍 **Поиск профилей**\n\nВведи username:",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_username)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_username)
+async def sherlock_search(message: types.Message, state: FSMContext):
+    username = message.text.strip()
+    await message.answer(f"🔍 Ищу профили для `{username}`...", parse_mode="Markdown")
+    await message.answer("Что дальше?", reply_markup=main_menu())
+    await state.clear()
+
+# =============== ЗАПУСК ===============
+async def main():
+    print("🤖 Бот запущен v7.0!")
+    print(f"📁 Папка с базами: {os.path.abspath(DATABASES_DIR)}")
+    
+    dbs = db_searcher.scan_databases()
+    print(f"📊 Найдено баз: {len(dbs)}")
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
