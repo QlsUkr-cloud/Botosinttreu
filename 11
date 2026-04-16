@@ -1,0 +1,398 @@
+import asyncio
+import logging
+import os
+import re
+import json
+import secrets
+import csv
+import glob
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+import phonenumbers
+from phonenumbers import carrier, geocoder
+import aiohttp
+import urllib.parse
+
+# =============== ЗАГРУЗКА ТОКЕНОВ ===============
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OWNER_ID = int(os.getenv("OWNER_ID", "8640510286"))
+
+if not BOT_TOKEN or not OPENAI_API_KEY:
+    print("❌ ОШИБКА: Проверь .env файл!")
+    exit(1)
+
+print("✅ Токены загружены успешно!")
+
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# =============== НАЛАШТУВАННЯ ДЛЯ БАЗ ДАНИХ ===============
+# ВАЖЛИВО: папка database має бути в тій самій папці, де бот
+DATABASES_DIR = "database"  # ← ОСЬ ТАК ПРАВИЛЬНО!
+
+# Якщо папка не існує - створюємо
+if not os.path.exists(DATABASES_DIR):
+    os.makedirs(DATABASES_DIR)
+    print(f"📁 Створено папку: {DATABASES_DIR}")
+
+# =============== ФАЙЛЫ ДЛЯ ХРАНЕНИЯ ===============
+WHITELIST_FILE = "whitelist.json"
+PROMOCODES_FILE = "promocodes.json"
+
+def load_whitelist():
+    if os.path.exists(WHITELIST_FILE):
+        with open(WHITELIST_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_whitelist(whitelist):
+    with open(WHITELIST_FILE, "w", encoding='utf-8') as f:
+        json.dump(whitelist, f, indent=2, ensure_ascii=False)
+
+def load_promocodes():
+    if os.path.exists(PROMOCODES_FILE):
+        with open(PROMOCODES_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    promocodes = {}
+    for i in range(30):
+        code = secrets.token_hex(5).upper()
+        promocodes[code] = {"used": False, "used_by": None, "user_data": None}
+    save_promocodes(promocodes)
+    return promocodes
+
+def save_promocodes(promocodes):
+    with open(PROMOCODES_FILE, "w", encoding='utf-8') as f:
+        json.dump(promocodes, f, indent=2, ensure_ascii=False)
+
+whitelist = load_whitelist()
+promocodes = load_promocodes()
+
+# =============== ПРОВЕРКА БЕЛОГО СПИСКА ===============
+def is_whitelisted(username=None, phone=None, user_id=None):
+    for entry in whitelist.values():
+        if username and entry.get("username") == username:
+            return True
+        if phone and entry.get("phone") == phone:
+            return True
+        if user_id and entry.get("user_id") == user_id:
+            return True
+    return False
+
+def add_to_whitelist(user_id, username, phone, promo_code):
+    whitelist[str(user_id)] = {
+        "user_id": user_id,
+        "username": username,
+        "phone": phone,
+        "added_at": datetime.now().isoformat(),
+        "promo_code": promo_code
+    }
+    save_whitelist(whitelist)
+
+# =============== КЛАС ДЛЯ ПОШУКУ ПО БАЗАХ ===============
+class DatabaseSearcher:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.databases_info = {}
+        self.loaded = False
+    
+    def scan_databases(self):
+        """Сканує папку databases і повертає список файлів"""
+        if not os.path.exists(self.db_path):
+            os.makedirs(self.db_path)
+            return {}
+        
+        databases = {}
+        files = []
+        
+        for ext in ['*.csv', '*.txt', '*.xlsx']:
+            files.extend(glob.glob(os.path.join(self.db_path, ext)))
+        
+        for file_path in files:
+            file_name = os.path.basename(file_path)
+            try:
+                file_size = os.path.getsize(file_path)
+                size_mb = file_size / (1024 * 1024)
+                
+                databases[file_name] = {
+                    'path': file_path,
+                    'size_mb': round(size_mb, 2),
+                    'type': file_path.split('.')[-1]
+                }
+                print(f"📁 Знайдено базу: {file_name} ({size_mb:.2f} МБ)")
+            except Exception as e:
+                print(f"❌ Помилка: {e}")
+        
+        self.databases_info = databases
+        self.loaded = True
+        return databases
+    
+    def search_in_file(self, file_path, phone_number):
+        """Пошук номера в одному файлі"""
+        phone_clean = re.sub(r'\D', '', phone_number)
+        phone_last7 = phone_clean[-7:] if len(phone_clean) >= 7 else phone_clean
+        
+        results = []
+        
+        try:
+            if file_path.endswith('.csv'):
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    sample = f.read(1024)
+                    f.seek(0)
+                    delimiter = ';' if ';' in sample else ','
+                    reader = csv.reader(f, delimiter=delimiter)
+                    for row_num, row in enumerate(reader):
+                        if row_num > 50000:
+                            break
+                        for cell in row:
+                            cell_str = str(cell)
+                            cell_clean = re.sub(r'\D', '', cell_str)
+                            if (phone_clean == cell_clean or 
+                                cell_clean.endswith(phone_last7)):
+                                results.append({
+                                    'row': row_num + 1,
+                                    'data': cell_str[:100]
+                                })
+                                if len(results) >= 5:
+                                    return results
+            
+            elif file_path.endswith('.txt'):
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line_num, line in enumerate(f):
+                        if line_num > 50000:
+                            break
+                        line = line.strip()
+                        if phone_number in line or phone_clean in re.sub(r'\D', '', line):
+                            results.append({
+                                'row': line_num + 1,
+                                'data': line[:100]
+                            })
+                            if len(results) >= 5:
+                                return results
+        
+        except Exception as e:
+            pass
+        
+        return results
+    
+    def search_all(self, phone_number):
+        if not self.loaded:
+            self.scan_databases()
+        
+        if not self.databases_info:
+            return None
+        
+        all_results = {}
+        for name, info in self.databases_info.items():
+            results = self.search_in_file(info['path'], phone_number)
+            if results:
+                all_results[name] = {
+                    'info': info,
+                    'matches': results,
+                    'count': len(results)
+                }
+        
+        return all_results if all_results else None
+
+# =============== СТВОРЮЄМО ПОШУКОВЦЯ ===============
+db_searcher = DatabaseSearcher(DATABASES_DIR)
+
+# =============== СОСТОЯНИЯ ===============
+class InputStates(StatesGroup):
+    waiting_username = State()
+    waiting_phone = State()
+    waiting_factcheck = State()
+    waiting_iin = State()
+    waiting_dork_query = State()
+    waiting_webarchive = State()
+    waiting_promocode = State()
+    waiting_complex = State()
+    waiting_db_search = State()
+
+# =============== КЛАВИАТУРЫ ===============
+def main_menu():
+    buttons = [
+        [InlineKeyboardButton(text="🔍 Sherlock", callback_data="sherlock")],
+        [InlineKeyboardButton(text="📞 Анализ номера", callback_data="phone")],
+        [InlineKeyboardButton(text="🗄️ Поиск по базам", callback_data="search_db")],
+        [InlineKeyboardButton(text="✅ Проверка фактов", callback_data="factcheck")],
+        [InlineKeyboardButton(text="🆔 Анализ ИНН", callback_data="iin")],
+        [InlineKeyboardButton(text="🔎 Google Dork", callback_data="dork_menu")],
+        [InlineKeyboardButton(text="📁 WebArchive", callback_data="webarchive")],
+        [InlineKeyboardButton(text="🔐 Активация промокода", callback_data="activate_promo")],
+        [InlineKeyboardButton(text="📊 Комплексный анализ", callback_data="complex")],
+        [InlineKeyboardButton(text="ℹ️ Инфо о боте", callback_data="info")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def dork_menu():
+    buttons = [
+        [InlineKeyboardButton(text="👤 Поиск человека", callback_data="dork_person")],
+        [InlineKeyboardButton(text="📧 Поиск email", callback_data="dork_email")],
+        [InlineKeyboardButton(text="📂 Документы", callback_data="dork_docs")],
+        [InlineKeyboardButton(text="💀 Админки", callback_data="dork_admin")],
+        [InlineKeyboardButton(text="🔐 Секретные файлы", callback_data="dork_secret")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# =============== ОБРАБОТЧИК КОМАНДЫ /start ===============
+@dp.message(Command("start"))
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "🤖 **OSINT Power Bot v6.0**\n\n"
+        "Я умею:\n"
+        "🔍 Искать профили по username\n"
+        "📞 Анализировать номера телефонов\n"
+        "🗄️ Искать номера в ваших базах данных\n"
+        "✅ Проверять факты через ИИ\n"
+        "🆔 Анализировать ИНН 4 стран\n"
+        "🔎 Google Dork\n"
+        "📁 WebArchive\n"
+        "📊 Комплексный анализ\n\n"
+        "Выбери инструмент в меню 👇",
+        reply_markup=main_menu(),
+        parse_mode="Markdown"
+    )
+
+# =============== КОМАНДА ДЛЯ ЗАГРУЗКИ БАЗ ===============
+@dp.message(Command("load_databases"))
+async def load_databases_cmd(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("❌ Доступ запрещен.")
+        return
+    
+    await message.answer("🔄 **Сканирование папки с базами данных...**", parse_mode="Markdown")
+    databases = db_searcher.scan_databases()
+    
+    if databases:
+        total_size = sum(db['size_mb'] for db in databases.values())
+        db_list = "\n".join([f"• `{name}` ({info['size_mb']} МБ)" for name, info in databases.items()])
+        await message.answer(
+            f"✅ **Найдено {len(databases)} баз(ы) данных**\n"
+            f"💾 Общий размер: {round(total_size, 2)} МБ\n\n"
+            f"📋 Список:\n{db_list}",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            f"❌ **Базы данных не найдены!**\n\n"
+            f"Проверь папку: `{DATABASES_DIR}`\n\n"
+            f"Убедись что там есть файлы .csv, .txt или .xlsx",
+            parse_mode="Markdown"
+        )
+
+# =============== ПОИСК ПО БАЗАМ ===============
+@dp.callback_query(lambda c: c.data == "search_db")
+async def search_db_start(callback: types.CallbackQuery, state: FSMContext):
+    databases = db_searcher.scan_databases()
+    
+    if not databases:
+        await callback.message.edit_text(
+            "❌ **Базы данных не найдены!**\n\n"
+            "Нажми /load_databases чтобы загрузить базы",
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+    
+    await callback.message.edit_text(
+        "🗄️ **Поиск по базам данных**\n\n"
+        "Введи номер телефона для поиска:\n"
+        "Форматы: `+380991234567` или `380991234567` или `0991234567`\n\n"
+        f"📁 Доступно баз: {len(databases)}",
+        parse_mode="Markdown"
+    )
+    await state.set_state(InputStates.waiting_db_search)
+    await callback.answer()
+
+@dp.message(InputStates.waiting_db_search)
+async def search_in_databases(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    phone_clean = re.sub(r'\D', '', phone)
+    
+    if len(phone_clean) < 7:
+        await message.answer("❌ Введи корректный номер (минимум 7 цифр)")
+        return
+    
+    await message.answer(f"🔍 **Ищу `{phone}` в базах данных...**\n\n⏳ Подожди...", parse_mode="Markdown")
+    
+    results = await asyncio.to_thread(db_searcher.search_all, phone)
+    
+    if not results:
+        await message.answer(
+            f"❌ **Ничего не найдено** для номера `{phone}`\n\n"
+            f"📊 Проверено {len(db_searcher.databases_info)} баз(ы)",
+            parse_mode="Markdown"
+        )
+    else:
+        response = f"🔍 **Результаты поиска для `{phone}`**\n\n"
+        response += f"✅ Найдено в {len(results)} базах:\n\n"
+        
+        for db_name, data in results.items():
+            response += f"📁 **{db_name}** ({data['info']['size_mb']} МБ) - {data['count']} совпадений\n"
+            for i, match in enumerate(data['matches'][:3]):
+                response += f"  {i+1}. {match['data']}\n"
+            response += "\n"
+        
+        response += "\n⚠️ *Данные из открытых источников. Проверяйте достоверность!*"
+        
+        if len(response) > 4000:
+            for i in range(0, len(response), 4000):
+                await message.answer(response[i:i+4000], parse_mode="Markdown")
+        else:
+            await message.answer(response, parse_mode="Markdown")
+    
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=main_menu())
+
+# =============== ИНФО ===============
+@dp.callback_query(lambda c: c.data == "info")
+async def bot_info(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "📊 **Информация о боте v6.0**\n\n"
+        "**Возможности:**\n"
+        "• Поиск профилей (Sherlock)\n"
+        "• Анализ номеров телефонов\n"
+        "• Поиск по вашим базам данных\n"
+        "• Проверка фактов через ИИ\n"
+        "• Анализ ИНН 4 стран\n"
+        "• Google Dork\n"
+        "• WebArchive\n\n"
+        "**Команды:**\n"
+        "/start - Главное меню\n"
+        "/load_databases - Загрузить базы",
+        parse_mode="Markdown",
+        reply_markup=main_menu()
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("🤖 **Главное меню**", reply_markup=main_menu(), parse_mode="Markdown")
+    await callback.answer()
+
+# =============== ЗАПУСК ===============
+async def main():
+    print("🤖 Бот запущен!")
+    print(f"📁 Папка с базами: {os.path.abspath(DATABASES_DIR)}")
+    
+    dbs = db_searcher.scan_databases()
+    print(f"📊 Найдено баз: {len(dbs)}")
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
