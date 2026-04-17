@@ -1,0 +1,691 @@
+import asyncio
+import logging
+import os
+import re
+import json
+import secrets
+import csv
+import sqlite3
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
+import phonenumbers
+from phonenumbers import carrier, geocoder
+import aiohttp
+import urllib.parse
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "8640510286"))
+
+if not BOT_TOKEN:
+    print("❌ Немає BOT_TOKEN в .env")
+    exit(1)
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# =============== БАЗА ДАНИХ ===============
+USERS_DB = "users.db"
+
+def init_db():
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        language TEXT DEFAULT 'uk',
+        promo_code TEXT,
+        promo_expiry TEXT,
+        search_count INTEGER DEFAULT 0
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS search_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, query TEXT, query_type TEXT, 
+        country TEXT, result_count INTEGER, search_date TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_user(user_id):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT language, promo_code, promo_expiry FROM users WHERE user_id = ?", (user_id,))
+    r = cursor.fetchone()
+    conn.close()
+    return {"language": r[0], "promo_code": r[1], "promo_expiry": r[2]} if r else None
+
+def save_user(user_id, lang="uk"):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO users (user_id, language, search_count) VALUES (?, ?, COALESCE((SELECT search_count FROM users WHERE user_id = ?), 0))", 
+                   (user_id, lang, user_id))
+    conn.commit()
+    conn.close()
+
+def update_promo(user_id, code):
+    expiry = (datetime.now() + timedelta(days=30)).isoformat()
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET promo_code = ?, promo_expiry = ? WHERE user_id = ?", (code, expiry, user_id))
+    conn.commit()
+    conn.close()
+
+def check_promo(user_id):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT promo_expiry FROM users WHERE user_id = ?", (user_id,))
+    r = cursor.fetchone()
+    conn.close()
+    if r and r[0]:
+        return datetime.fromisoformat(r[0]) > datetime.now()
+    return False
+
+def add_history(user_id, query, qtype, country, count):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO search_history (user_id, query, query_type, country, result_count, search_date) VALUES (?,?,?,?,?,?)",
+                   (user_id, query, qtype, country, count, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def inc_search(user_id):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET search_count = search_count + 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+# =============== НАЛАШТУВАННЯ ===============
+DATABASES_DIR = "database"
+
+COUNTRIES = {
+    "rf": "🇷🇺 РОССИЯ",
+    "ua": "🇺🇦 УКРАЇНА", 
+    "kz": "🇰🇿 КАЗАХСТАН",
+    "by": "🇧🇾 БЕЛАРУСЬ",
+    "md": "🇲🇩 МОЛДОВА",
+    "gmail": "📧 GMAIL"
+}
+
+# Створюємо папки
+for folder in COUNTRIES.keys():
+    os.makedirs(os.path.join(DATABASES_DIR, folder), exist_ok=True)
+
+# =============== ІНДЕКС ДАНИХ (ШВИДКИЙ ПОШУК) ===============
+class FastSearcher:
+    def __init__(self):
+        self.index = {}  # {країна: {номер: [рядки], фіо: [рядки], email: [рядки]}}
+        self.loaded = False
+    
+    def load_all(self):
+        """Завантажує всі бази в пам'ять (швидкий доступ)"""
+        print("📂 Завантаження баз даних...")
+        for country_code in COUNTRIES:
+            self.index[country_code] = {"phones": {}, "names": {}, "emails": [], "raw": []}
+            folder = os.path.join(DATABASES_DIR, country_code)
+            if not os.path.exists(folder):
+                continue
+            
+            for file in os.listdir(folder):
+                if file.endswith(('.csv', '.txt')):
+                    path = os.path.join(folder, file)
+                    try:
+                        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                            sample = f.read(1024)
+                            f.seek(0)
+                            delim = ';' if ';' in sample else ','
+                            reader = csv.reader(f, delimiter=delim)
+                            for row in reader:
+                                if row:
+                                    self.index[country_code]["raw"].append(row)
+                                    # Індексація
+                                    for cell in row:
+                                        cell_str = str(cell).strip()
+                                        # Телефони
+                                        phone_clean = re.sub(r'\D', '', cell_str)
+                                        if len(phone_clean) >= 7:
+                                            if phone_clean not in self.index[country_code]["phones"]:
+                                                self.index[country_code]["phones"][phone_clean] = []
+                                            self.index[country_code]["phones"][phone_clean].append(row)
+                                        # Імена (2+ слова з великої літери)
+                                        if re.match(r'[А-ЯЁІЇЄ][а-яёіїє]+\s+[А-ЯЁІЇЄ][а-яёіїє]+', cell_str):
+                                            name_lower = cell_str.lower()
+                                            if name_lower not in self.index[country_code]["names"]:
+                                                self.index[country_code]["names"][name_lower] = []
+                                            self.index[country_code]["names"][name_lower].append(row)
+                                        # Email
+                                        if '@' in cell_str and '.' in cell_str:
+                                            self.index[country_code]["emails"].append((cell_str.lower(), row))
+                        print(f"   ✅ {country_code}: {os.path.basename(file)}")
+                    except Exception as e:
+                        print(f"   ❌ Помилка {file}: {e}")
+        self.loaded = True
+        print("✅ Всі бази завантажено!")
+    
+    def search_phone(self, country, phone):
+        """Швидкий пошук за номером"""
+        if not self.loaded:
+            self.load_all()
+        phone_clean = re.sub(r'\D', '', phone)
+        results = []
+        # Точний збіг
+        if phone_clean in self.index.get(country, {}).get("phones", {}):
+            results.extend(self.index[country]["phones"][phone_clean])
+        # Пошук по закінченню
+        for p, rows in self.index.get(country, {}).get("phones", {}).items():
+            if p.endswith(phone_clean[-7:]) and len(p) >= 7:
+                results.extend(rows)
+        return list({tuple(r) for r in results})[:50]
+    
+    def search_name(self, country, name):
+        """Швидкий пошук за ФІО"""
+        if not self.loaded:
+            self.load_all()
+        name_lower = name.lower().strip()
+        results = []
+        # Точний збіг
+        if name_lower in self.index.get(country, {}).get("names", {}):
+            results.extend(self.index[country]["names"][name_lower])
+        # Частковий збіг
+        for n, rows in self.index.get(country, {}).get("names", {}).items():
+            if name_lower in n or all(p in n for p in name_lower.split()):
+                results.extend(rows)
+        return list({tuple(r) for r in results})[:50]
+    
+    def search_email(self, country, email):
+        """Швидкий пошук за email"""
+        if not self.loaded:
+            self.load_all()
+        email_lower = email.lower()
+        results = []
+        for e, row in self.index.get(country, {}).get("emails", []):
+            if email_lower in e or e == email_lower:
+                results.append(row)
+        return list({tuple(r) for r in results})[:50]
+    
+    def extract_all_info(self, country, rows):
+        """Витягує всю інформацію з знайдених рядків"""
+        all_phones = set()
+        all_names = set()
+        all_emails = set()
+        all_iin = set()
+        all_addresses = set()
+        
+        for row in rows:
+            for cell in row:
+                cell_str = str(cell).strip()
+                # Телефони
+                phone_clean = re.sub(r'\D', '', cell_str)
+                if len(phone_clean) >= 7:
+                    all_phones.add(phone_clean)
+                # Імена
+                if re.match(r'[А-ЯЁІЇЄ][а-яёіїє]+\s+[А-ЯЁІЇЄ][а-яёіїє]+', cell_str):
+                    all_names.add(cell_str)
+                # Email
+                if '@' in cell_str and '.' in cell_str:
+                    all_emails.add(cell_str.lower())
+                # ІІН (12 цифр для КЗ, 10 для УА)
+                if re.match(r'^\d{10}$', cell_str) or re.match(r'^\d{12}$', cell_str):
+                    all_iin.add(cell_str)
+                # Адреса
+                if any(word in cell_str.lower() for word in ['вул', 'ул', 'просп', 'пр', 'бульв', 'місто', 'город', 'село']):
+                    all_addresses.add(cell_str)
+        
+        return {
+            "phones": list(all_phones),
+            "names": list(all_names),
+            "emails": list(all_emails),
+            "iin": list(all_iin),
+            "addresses": list(all_addresses)
+        }
+    
+    def deep_search(self, country, start_query, query_type="phone", max_depth=3):
+        """Глибокий рекурсивний пошук"""
+        found_data = {}
+        all_rows = []
+        queue = [(start_query, query_type, 0)]
+        processed = set()
+        
+        while queue:
+            query, qtype, depth = queue.pop(0)
+            if depth > max_depth:
+                continue
+            
+            key = f"{qtype}:{query}"
+            if key in processed:
+                continue
+            processed.add(key)
+            
+            # Пошук
+            if qtype == "phone":
+                rows = self.search_phone(country, query)
+            elif qtype == "email":
+                rows = self.search_email(country, query)
+            else:
+                rows = self.search_name(country, query)
+            
+            for row in rows:
+                if tuple(row) not in all_rows:
+                    all_rows.append(tuple(row))
+            
+            # Витягуємо нові дані для подальшого пошуку
+            info = self.extract_all_info(country, rows)
+            
+            for phone in info["phones"][:5]:
+                if f"phone:{phone}" not in processed:
+                    queue.append((phone, "phone", depth + 1))
+            for name in info["names"][:5]:
+                if f"name:{name}" not in processed:
+                    queue.append((name, "name", depth + 1))
+            for email in info["emails"][:3]:
+                if f"email:{email}" not in processed:
+                    queue.append((email, "email", depth + 1))
+        
+        return {
+            "total": len(all_rows),
+            "rows": [list(r) for r in all_rows],
+            "info": self.extract_all_info(country, all_rows)
+        }
+
+searcher = FastSearcher()
+
+# =============== МОВИ ===============
+LANGUAGES = {
+    "uk": {
+        "start": "🤖 OSINT Power Bot v10.0\n\n🔍 ШВИДКИЙ ТОЧНИЙ ПОШУК:\n• За номером телефону\n• За ФІО\n• За Email\n\n🇷🇺🇺🇦🇰🇿🇧🇾🇲🇩 Оберіть країну:",
+        "main_menu": "🔍 Головне меню\n\nОберіть країну для пошуку:",
+        "search_phone": "📞 Пошук за номером",
+        "search_fio": "👤 Пошук за ФІО",
+        "search_email": "📧 Пошук за Email (промокод)",
+        "deep_search": "🔄 ГЛИБОКИЙ ПОШУК (всі зв'язки)",
+        "activate_promo": "🔐 Активація промокоду",
+        "change_lang": "🌍 Змінити мову",
+        "info": "ℹ️ Інфо",
+        "history": "📜 Історія",
+        "enter_phone": "📞 Введіть номер телефону:",
+        "enter_fio": "👤 Введіть ПІБ:",
+        "enter_email": "📧 Введіть Email:",
+        "not_found": "❌ Нічого не знайдено",
+        "found": "✅ Знайдено {count} записів\n\n",
+        "promo_required": "❌ Потрібен промокод. Введіть:",
+        "promo_activated": "✅ Промокод активовано на 30 днів!",
+        "promo_invalid": "❌ Невірний промокод",
+        "lang_changed": "🌍 Мову змінено",
+        "back": "◀️ Назад",
+        "searching": "🔍 Шукаю {query} в {country}...",
+        "deep_searching": "🔄 ГЛИБОКИЙ ПОШУК: {query}\n⏳ Це може зайняти до 30 секунд...",
+        "deep_result": "📊 **РЕЗУЛЬТАТ ГЛИБОКОГО ПОШУКУ**\n\n📌 Знайдено всього записів: {total}\n\n📞 Телефони: {phones}\n👤 Імена: {names}\n📧 Email: {emails}\n🆔 ІІН: {iin}\n🏠 Адреси: {addresses}\n\n",
+        "promo_active": "✅ Промокод активний"
+    },
+    "ru": {
+        "start": "🤖 OSINT Power Bot v10.0\n\n🔍 БЫСТРЫЙ ТОЧНЫЙ ПОИСК:\n• По номеру телефона\n• По ФИО\n• По Email\n\n🇷🇺🇺🇦🇰🇿🇧🇾🇲🇩 Выберите страну:",
+        "main_menu": "🔍 Главное меню\n\nВыберите страну:",
+        "search_phone": "📞 Поиск по номеру",
+        "search_fio": "👤 Поиск по ФИО",
+        "search_email": "📧 Поиск по Email (промокод)",
+        "deep_search": "🔄 ГЛУБОКИЙ ПОИСК (все связи)",
+        "activate_promo": "🔐 Активация промокода",
+        "change_lang": "🌍 Сменить язык",
+        "info": "ℹ️ Инфо",
+        "history": "📜 История",
+        "enter_phone": "📞 Введите номер телефона:",
+        "enter_fio": "👤 Введите ФИО:",
+        "enter_email": "📧 Введите Email:",
+        "not_found": "❌ Ничего не найдено",
+        "found": "✅ Найдено {count} записей\n\n",
+        "promo_required": "❌ Нужен промокод. Введите:",
+        "promo_activated": "✅ Промокод активирован на 30 дней!",
+        "promo_invalid": "❌ Неверный промокод",
+        "lang_changed": "🌍 Язык изменен",
+        "back": "◀️ Назад",
+        "searching": "🔍 Ищу {query} в {country}...",
+        "deep_searching": "🔄 ГЛУБОКИЙ ПОИСК: {query}\n⏳ Это может занять до 30 секунд...",
+        "deep_result": "📊 **РЕЗУЛЬТАТ ГЛУБОКОГО ПОИСКА**\n\n📌 Всего записей: {total}\n\n📞 Телефоны: {phones}\n👤 Имена: {names}\n📧 Email: {emails}\n🆔 ИИН: {iin}\n🏠 Адреса: {addresses}\n\n",
+        "promo_active": "✅ Промокод активен"
+    }
+}
+
+def get_text(user_id, key, **kwargs):
+    user = get_user(user_id)
+    lang = user["language"] if user else "uk"
+    text = LANGUAGES.get(lang, LANGUAGES["uk"]).get(key, key)
+    return text.format(**kwargs) if kwargs else text
+
+# =============== ПРОМОКОДИ ===============
+PROMOCODES_FILE = "promocodes.json"
+
+def load_promocodes():
+    if os.path.exists(PROMOCODES_FILE):
+        with open(PROMOCODES_FILE, 'r') as f:
+            return json.load(f)
+    codes = {}
+    for _ in range(50):
+        code = secrets.token_hex(4).upper()
+        codes[code] = {"used": False}
+    save_promocodes(codes)
+    return codes
+
+def save_promocodes(codes):
+    with open(PROMOCODES_FILE, 'w') as f:
+        json.dump(codes, f, indent=2)
+
+promocodes = load_promocodes()
+
+# =============== КЛАВІАТУРИ ===============
+def country_keyboard(user_id):
+    """Прямі кнопки країн"""
+    buttons = []
+    row = []
+    for i, (code, name) in enumerate(COUNTRIES.items()):
+        row.append(InlineKeyboardButton(text=name, callback_data=f"country_{code}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    
+    buttons.append([InlineKeyboardButton(text=get_text(user_id, "activate_promo"), callback_data="promo")])
+    buttons.append([InlineKeyboardButton(text=get_text(user_id, "change_lang"), callback_data="lang")])
+    buttons.append([InlineKeyboardButton(text=get_text(user_id, "info"), callback_data="info")])
+    buttons.append([InlineKeyboardButton(text=get_text(user_id, "history"), callback_data="history")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def action_keyboard(user_id, country_code):
+    """Клавіатура дій після вибору країни"""
+    country_name = COUNTRIES.get(country_code, country_code)
+    buttons = [
+        [InlineKeyboardButton(text=get_text(user_id, "search_phone"), callback_data=f"action_phone_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_fio"), callback_data=f"action_fio_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_email"), callback_data=f"action_email_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "deep_search"), callback_data=f"action_deep_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "back"), callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def lang_menu():
+    buttons = [
+        [InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang_uk")],
+        [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# =============== ОБРОБНИКИ ===============
+class States(StatesGroup):
+    waiting_phone = State()
+    waiting_fio = State()
+    waiting_email = State()
+    waiting_promo = State()
+
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    if not get_user(user_id):
+        save_user(user_id)
+    await message.answer(get_text(user_id, "start"), reply_markup=country_keyboard(user_id))
+
+@dp.callback_query(lambda c: c.data == "back")
+async def back_to_countries(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    await state.clear()
+    await callback.message.edit_text(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("country_"))
+async def select_country(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    country_code = callback.data.split("_")[1]
+    await state.update_data(country=country_code)
+    await callback.message.edit_text(
+        f"{COUNTRIES[country_code]}\n\n{get_text(user_id, 'main_menu')}",
+        reply_markup=action_keyboard(user_id, country_code)
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("action_"))
+async def handle_action(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    parts = callback.data.split("_")
+    action = parts[1]
+    country = parts[2]
+    
+    await state.update_data(country=country)
+    
+    if action == "phone":
+        await callback.message.edit_text(get_text(user_id, "enter_phone"))
+        await state.set_state(States.waiting_phone)
+    elif action == "fio":
+        await callback.message.edit_text(get_text(user_id, "enter_fio"))
+        await state.set_state(States.waiting_fio)
+    elif action == "email":
+        if not check_promo(user_id):
+            await callback.message.edit_text(get_text(user_id, "promo_required"))
+            await state.set_state(States.waiting_promo)
+            await state.update_data(next_action="email")
+        else:
+            await callback.message.edit_text(get_text(user_id, "enter_email"))
+            await state.set_state(States.waiting_email)
+    elif action == "deep":
+        if not check_promo(user_id):
+            await callback.message.edit_text(get_text(user_id, "promo_required"))
+            await state.set_state(States.waiting_promo)
+            await state.update_data(next_action="deep")
+        else:
+            await callback.message.edit_text(get_text(user_id, "enter_phone") + "\n\n(або введіть ФІО чи Email)")
+            await state.set_state(States.waiting_phone)
+            await state.update_data(deep_mode=True)
+    
+    await callback.answer()
+
+@dp.message(States.waiting_phone)
+async def search_phone(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    country = data.get("country")
+    deep_mode = data.get("deep_mode", False)
+    
+    if not country:
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+        await state.clear()
+        return
+    
+    country_name = COUNTRIES.get(country, country)
+    
+    if deep_mode:
+        await message.answer(get_text(user_id, "deep_searching", query=query))
+        result = await asyncio.to_thread(searcher.deep_search, country, query, "phone", 3)
+        
+        inc_search(user_id)
+        add_history(user_id, query, "deep", country, result["total"])
+        
+        phones = ", ".join(result["info"]["phones"][:10]) if result["info"]["phones"] else "немає"
+        names = ", ".join(result["info"]["names"][:10]) if result["info"]["names"] else "немає"
+        emails = ", ".join(result["info"]["emails"][:5]) if result["info"]["emails"] else "немає"
+        iin = ", ".join(result["info"]["iin"][:5]) if result["info"]["iin"] else "немає"
+        addresses = ", ".join(result["info"]["addresses"][:5]) if result["info"]["addresses"] else "немає"
+        
+        await message.answer(get_text(user_id, "deep_result",
+            total=result["total"],
+            phones=phones, names=names, emails=emails, iin=iin, addresses=addresses
+        ))
+        
+        for row in result["rows"][:10]:
+            await message.answer("📋 " + " | ".join(str(c) for c in row if c)[:500])
+    else:
+        await message.answer(get_text(user_id, "searching", query=query, country=country_name))
+        results = await asyncio.to_thread(searcher.search_phone, country, query)
+        inc_search(user_id)
+        add_history(user_id, query, "phone", country, len(results))
+        
+        if results:
+            await message.answer(get_text(user_id, "found", count=len(results)))
+            for row in results[:10]:
+                await message.answer("📋 " + " | ".join(str(c) for c in row if c)[:500])
+        else:
+            await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+@dp.message(States.waiting_fio)
+async def search_fio(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    country = data.get("country")
+    
+    if not country:
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+        await state.clear()
+        return
+    
+    country_name = COUNTRIES.get(country, country)
+    await message.answer(get_text(user_id, "searching", query=query, country=country_name))
+    
+    results = await asyncio.to_thread(searcher.search_name, country, query)
+    inc_search(user_id)
+    add_history(user_id, query, "fio", country, len(results))
+    
+    if results:
+        await message.answer(get_text(user_id, "found", count=len(results)))
+        for row in results[:10]:
+            await message.answer("📋 " + " | ".join(str(c) for c in row if c)[:500])
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+@dp.message(States.waiting_email)
+async def search_email(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip().lower()
+    data = await state.get_data()
+    country = data.get("country")
+    
+    if not country:
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+        await state.clear()
+        return
+    
+    country_name = COUNTRIES.get(country, country)
+    await message.answer(get_text(user_id, "searching", query=query, country=country_name))
+    
+    results = await asyncio.to_thread(searcher.search_email, country, query)
+    inc_search(user_id)
+    add_history(user_id, query, "email", country, len(results))
+    
+    if results:
+        await message.answer(get_text(user_id, "found", count=len(results)))
+        for row in results[:10]:
+            await message.answer("📋 " + " | ".join(str(c) for c in row if c)[:500])
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+@dp.message(States.waiting_promo)
+async def process_promo(message: types.Message, state: States):
+    user_id = message.from_user.id
+    code = message.text.strip().upper()
+    data = await state.get_data()
+    next_action = data.get("next_action")
+    country = data.get("country")
+    
+    if code in promocodes and not promocodes[code]["used"]:
+        promocodes[code]["used"] = True
+        save_promocodes(promocodes)
+        update_promo(user_id, code)
+        await message.answer(get_text(user_id, "promo_activated"))
+        
+        if next_action == "email":
+            await message.answer(get_text(user_id, "enter_email"))
+            await state.set_state(States.waiting_email)
+            await state.update_data(country=country)
+        elif next_action == "deep":
+            await message.answer(get_text(user_id, "enter_phone") + "\n\n(або введіть ФІО чи Email)")
+            await state.set_state(States.waiting_phone)
+            await state.update_data(country=country, deep_mode=True)
+        else:
+            await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+            await state.clear()
+    else:
+        await message.answer(get_text(user_id, "promo_invalid"))
+        await state.clear()
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+@dp.callback_query(lambda c: c.data == "promo")
+async def promo_start(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(get_text(user_id, "enter_promo"))
+    await state.set_state(States.waiting_promo)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "lang")
+async def lang_start(callback: types.CallbackQuery):
+    await callback.message.edit_text("🌍 Оберіть мову:", reply_markup=lang_menu())
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("lang_"))
+async def set_lang(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    lang = callback.data.split("_")[1]
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET language = ? WHERE user_id = ?", (lang, user_id))
+    conn.commit()
+    conn.close()
+    await callback.message.edit_text(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "info")
+async def show_info(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user = get_user(user_id)
+    info = f"🤖 OSINT Power Bot v10.0\n\n🔍 ШВИДКИЙ ПОШУК\n• Індексація при старті\n• Глибокий пошук всіх зв'язків\n• 6 країн + Gmail\n\n📊 Ваших пошуків: {user['search_count'] if user else 0}\n"
+    await callback.message.edit_text(info, reply_markup=country_keyboard(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "history")
+async def show_history(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT query, query_type, country, result_count, search_date FROM search_history WHERE user_id = ? ORDER BY search_date DESC LIMIT 10", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if rows:
+        text = "📜 **Останні пошуки:**\n\n"
+        for r in rows:
+            text += f"• {r[0]} ({COUNTRIES.get(r[2], r[2])}) - {r[3]} знайдено\n"
+        await callback.message.edit_text(text, reply_markup=country_keyboard(user_id))
+    else:
+        await callback.message.edit_text("📜 Історія порожня", reply_markup=country_keyboard(user_id))
+    await callback.answer()
+
+# =============== ЗАПУСК ===============
+async def main():
+    print("=" * 50)
+    print("🤖 OSINT Power Bot v10.0 - ШВИДКИЙ ПОШУК")
+    print("=" * 50)
+    
+    # Завантажуємо бази в пам'ять
+    await asyncio.to_thread(searcher.load_all)
+    
+    print("=" * 50)
+    print("✅ Бот готовий!")
+    print("=" * 50)
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
