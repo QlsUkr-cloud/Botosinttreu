@@ -1,0 +1,1185 @@
+import asyncio
+import logging
+import os
+import re
+import json
+import secrets
+import csv
+import glob
+import sqlite3
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+import phonenumbers
+from phonenumbers import carrier, geocoder
+import aiohttp
+import urllib.parse
+
+# =============== ЗАГРУЗКА ТОКЕНОВ ===============
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OWNER_ID = int(os.getenv("OWNER_ID", "8640510286"))
+
+if not BOT_TOKEN:
+    print("❌ ОШИБКА: Проверь .env файл!")
+    exit(1)
+
+print("✅ Токен загружен успешно!")
+
+if OPENAI_API_KEY:
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    ai_enabled = True
+else:
+    ai_enabled = False
+    print("⚠️ OpenAI API ключ не найден")
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# =============== БАЗА ДАНИХ КОРИСТУВАЧІВ ===============
+USERS_DB = "users.db"
+
+def init_users_db():
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            language TEXT DEFAULT 'uk',
+            promo_code TEXT,
+            promo_expiry TEXT,
+            last_active TEXT,
+            search_count INTEGER DEFAULT 0,
+            registered_at TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS search_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            query TEXT,
+            query_type TEXT,
+            country TEXT,
+            result_count INTEGER,
+            search_date TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_users_db()
+
+def get_user(user_id):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT language, promo_code, promo_expiry FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        return {"language": result[0], "promo_code": result[1], "promo_expiry": result[2]}
+    return None
+
+def save_user(user_id, language="uk"):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO users (user_id, language, last_active, registered_at, search_count)
+        VALUES (?, ?, ?, ?, COALESCE((SELECT search_count FROM users WHERE user_id = ?), 0))
+    ''', (user_id, language, datetime.now().isoformat(), datetime.now().isoformat(), user_id))
+    conn.commit()
+    conn.close()
+
+def update_user_language(user_id, language):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET language = ? WHERE user_id = ?", (language, user_id))
+    conn.commit()
+    conn.close()
+
+def update_user_promo(user_id, promo_code, days=30):
+    expiry = (datetime.now() + timedelta(days=days)).isoformat()
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET promo_code = ?, promo_expiry = ? WHERE user_id = ?", 
+                   (promo_code, expiry, user_id))
+    conn.commit()
+    conn.close()
+
+def check_promo_valid(user_id):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT promo_code, promo_expiry FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    if result and result[0] and result[1]:
+        expiry = datetime.fromisoformat(result[1])
+        if expiry > datetime.now():
+            return True
+    return False
+
+def add_search_history(user_id, query, query_type, country, result_count):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO search_history (user_id, query, query_type, country, result_count, search_date)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (user_id, query, query_type, country, result_count, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def increment_search_count(user_id):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET search_count = search_count + 1, last_active = ? WHERE user_id = ?",
+                   (datetime.now().isoformat(), user_id))
+    conn.commit()
+    conn.close()
+
+# =============== НАЛАШТУВАННЯ ===============
+DATABASES_DIR = "database"
+
+COUNTRIES = {
+    "rf": {"name": "🇷🇺 Россия", "code": "rf", "folder": "rf", "phone_codes": ["7", "79", "78"]},
+    "ua": {"name": "🇺🇦 Україна", "code": "ua", "folder": "ua", "phone_codes": ["380", "38"]},
+    "kz": {"name": "🇰🇿 Казахстан", "code": "kz", "folder": "kz", "phone_codes": ["77", "7"]},
+    "by": {"name": "🇧🇾 Беларусь", "code": "by", "folder": "by", "phone_codes": ["375", "37"]},
+    "md": {"name": "🇲🇩 Молдова", "code": "md", "folder": "md", "phone_codes": ["373", "37"]},
+    "gmail": {"name": "📧 Gmail бази", "code": "gmail", "folder": "gmail", "phone_codes": []}
+}
+
+for country in COUNTRIES.values():
+    folder_path = os.path.join(DATABASES_DIR, country["folder"])
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+        print(f"📁 Створено папку: {folder_path}")
+
+# =============== ТОЧНИЙ ПОШУК ===============
+class DatabaseSearcher:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.loaded_databases = {}
+    
+    def get_files_for_country(self, country_code):
+        country = COUNTRIES.get(country_code)
+        if not country:
+            return []
+        folder_path = os.path.join(self.db_path, country["folder"])
+        if not os.path.exists(folder_path):
+            return []
+        files = []
+        for ext in ['*.csv', '*.txt']:
+            files.extend(glob.glob(os.path.join(folder_path, ext)))
+        return files
+    
+    def load_country_data(self, country_code):
+        if country_code in self.loaded_databases:
+            return self.loaded_databases[country_code]
+        
+        files = self.get_files_for_country(country_code)
+        all_data = []
+        
+        for file_path in files:
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    sample = f.read(1024)
+                    f.seek(0)
+                    delimiter = ';' if ';' in sample else ','
+                    reader = csv.reader(f, delimiter=delimiter)
+                    for row in reader:
+                        if row and len(row) > 0:
+                            all_data.append(row)
+                print(f"✅ Завантажено {country_code}: {os.path.basename(file_path)}")
+            except Exception as e:
+                print(f"❌ Помилка {file_path}: {e}")
+        
+        self.loaded_databases[country_code] = all_data
+        return all_data
+    
+    def exact_search_phone(self, country_code, phone_number):
+        """ТОЧНИЙ пошук за номером телефону"""
+        data = self.load_country_data(country_code)
+        if not data:
+            return []
+        
+        phone_clean = re.sub(r'\D', '', phone_number)
+        results = []
+        
+        for row in data:
+            for cell in row:
+                cell_clean = re.sub(r'\D', '', str(cell))
+                if cell_clean == phone_clean:
+                    results.append(row)
+                    break
+                elif len(cell_clean) >= 7 and cell_clean.endswith(phone_clean[-7:]):
+                    results.append(row)
+                    break
+        
+        unique = []
+        for r in results:
+            if r not in unique:
+                unique.append(r)
+        return unique
+    
+    def exact_search_name(self, country_code, name_query):
+        """ТОЧНИЙ пошук за ФІО"""
+        data = self.load_country_data(country_code)
+        if not data:
+            return []
+        
+        name_lower = name_query.lower().strip()
+        name_parts = name_lower.split()
+        results = []
+        
+        for row in data:
+            row_text = " ".join(str(cell).lower() for cell in row)
+            
+            if name_lower in row_text:
+                results.append(row)
+                continue
+            
+            if len(name_parts) >= 2:
+                if all(part in row_text for part in name_parts):
+                    results.append(row)
+                    continue
+            
+            for cell in row:
+                cell_lower = str(cell).lower()
+                if cell_lower == name_lower:
+                    results.append(row)
+                    break
+                elif len(name_parts) >= 2 and all(part in cell_lower for part in name_parts):
+                    results.append(row)
+                    break
+        
+        unique = []
+        for r in results:
+            if r not in unique:
+                unique.append(r)
+        return unique
+    
+    def exact_search_email(self, country_code, email_query):
+        """ТОЧНИЙ пошук за email"""
+        data = self.load_country_data(country_code)
+        if not data:
+            return []
+        
+        email_lower = email_query.lower().strip()
+        results = []
+        
+        for row in data:
+            for cell in row:
+                cell_lower = str(cell).lower()
+                if cell_lower == email_lower:
+                    results.append(row)
+                    break
+                elif email_lower in cell_lower and '@' in cell_lower:
+                    results.append(row)
+                    break
+        
+        unique = []
+        for r in results:
+            if r not in unique:
+                unique.append(r)
+        return unique
+    
+    def partial_search_exact(self, country_code, **fields):
+        """Пошук за неповними даними"""
+        data = self.load_country_data(country_code)
+        if not data:
+            return []
+        
+        search_fields = {k: v.lower().strip() for k, v in fields.items() if v and v not in ["пропустити", "skip", "-"]}
+        
+        if not search_fields:
+            return []
+        
+        results = []
+        
+        for row in data:
+            row_text = " ".join(str(cell).lower() for cell in row)
+            match_score = 0
+            total_fields = len(search_fields)
+            
+            for field_name, field_value in search_fields.items():
+                field_found = False
+                for cell in row:
+                    cell_lower = str(cell).lower()
+                    if field_value in cell_lower or cell_lower == field_value:
+                        field_found = True
+                        break
+                if field_found:
+                    match_score += 1
+            
+            if match_score == total_fields:
+                results.append(row)
+        
+        return results
+
+db_searcher = DatabaseSearcher(DATABASES_DIR)
+
+# =============== МОВИ ===============
+LANGUAGES = {
+    "uk": {
+        "start": "🤖 Вітаю! Я OSINT Power Bot v10.0\n\n🔍 Я вмію ТОЧНО шукати:\n• За номером телефону\n• За ФІО (повний збіг)\n• За email\n• За неповними даними\n\n🇷🇺🇺🇦🇰🇿🇧🇾🇲🇩 Пошук по країнам\n\nОберіть мову:",
+        "main_menu": "🔍 Головне меню\n\nОберіть функцію:",
+        "search_by_country": "🌍 Пошук по країні",
+        "search_partial": "🔍 Пошук за неповними даними",
+        "search_phone": "📞 ТОЧНИЙ пошук за номером",
+        "search_fio": "👤 ТОЧНИЙ пошук за ФІО",
+        "search_email": "📧 ТОЧНИЙ пошук за Email",
+        "phone_analyze": "📊 Аналіз номера",
+        "factcheck": "✅ Перевірка фактів",
+        "google_dork": "🔎 Google Dork",
+        "webarchive": "📁 WebArchive",
+        "activate_promo": "🔐 Активація промокоду",
+        "change_lang": "🌍 Змінити мову",
+        "info": "ℹ️ Інфо",
+        "history": "📜 Історія пошуків",
+        "enter_phone": "📞 Введіть номер телефону:",
+        "enter_fio": "👤 Введіть ПІБ:",
+        "enter_email": "📧 Введіть Email:",
+        "enter_lastname": "📝 Введіть прізвище:",
+        "enter_firstname": "📝 Введіть ім'я:",
+        "enter_middlename": "📝 Введіть по батькові:",
+        "enter_birthday": "📅 Введіть дату народження:",
+        "enter_age": "🎂 Введіть вік:",
+        "enter_birthplace": "🏠 Введіть місце народження:",
+        "not_found": "❌ ТОЧНИХ збігів не знайдено",
+        "found_exact": "✅ Знайдено ТОЧНИХ збігів: {count}\n\n",
+        "promo_required": "❌ Ця функція платна. Введіть промокод:",
+        "promo_used": "❌ Промокод вже використано",
+        "promo_invalid": "❌ Невірний промокод",
+        "promo_activated": "✅ Промокод активовано на 30 днів!",
+        "lang_changed": "🌍 Мову змінено",
+        "back": "◀️ Назад",
+        "searching": "🔍 ТОЧНИЙ пошук: {query} в {country}...",
+        "select_country": "🌍 Оберіть країну для пошуку:",
+        "select_search_type": "🔍 Оберіть тип пошуку:",
+        "history_text": "📜 **Останні 10 пошуків:**\n\n{history}",
+        "enter_text": "📝 Введіть текст для перевірки:",
+        "enter_url": "🔗 Введіть URL сайту:"
+    },
+    "ru": {
+        "start": "🤖 Привет! Я OSINT Power Bot v10.0\n\n🔍 Я умею ТОЧНО искать:\n• По номеру телефона\n• По ФИО (полное совпадение)\n• По email\n• По неполным данным\n\n🇷🇺🇺🇦🇰🇿🇧🇾🇲🇩 Поиск по странам\n\nВыберите язык:",
+        "main_menu": "🔍 Главное меню\n\nВыберите функцию:",
+        "search_by_country": "🌍 Поиск по стране",
+        "search_partial": "🔍 Поиск по неполным данным",
+        "search_phone": "📞 ТОЧНЫЙ поиск по номеру",
+        "search_fio": "👤 ТОЧНЫЙ поиск по ФИО",
+        "search_email": "📧 ТОЧНЫЙ поиск по Email",
+        "phone_analyze": "📊 Анализ номера",
+        "factcheck": "✅ Проверка фактов",
+        "google_dork": "🔎 Google Dork",
+        "webarchive": "📁 WebArchive",
+        "activate_promo": "🔐 Активация промокода",
+        "change_lang": "🌍 Сменить язык",
+        "info": "ℹ️ Инфо",
+        "history": "📜 История поисков",
+        "enter_phone": "📞 Введите номер телефона:",
+        "enter_fio": "👤 Введите ФИО:",
+        "enter_email": "📧 Введите Email:",
+        "enter_lastname": "📝 Введите фамилию:",
+        "enter_firstname": "📝 Введите имя:",
+        "enter_middlename": "📝 Введите отчество:",
+        "enter_birthday": "📅 Введите дату рождения:",
+        "enter_age": "🎂 Введите возраст:",
+        "enter_birthplace": "🏠 Введите место рождения:",
+        "not_found": "❌ ТОЧНЫХ совпадений не найдено",
+        "found_exact": "✅ Найдено ТОЧНЫХ совпадений: {count}\n\n",
+        "promo_required": "❌ Эта функция платная. Введите промокод:",
+        "promo_used": "❌ Промокод уже использован",
+        "promo_invalid": "❌ Неверный промокод",
+        "promo_activated": "✅ Промокод активирован на 30 дней!",
+        "lang_changed": "🌍 Язык изменен",
+        "back": "◀️ Назад",
+        "searching": "🔍 ТОЧНЫЙ поиск: {query} в {country}...",
+        "select_country": "🌍 Выберите страну:",
+        "select_search_type": "🔍 Выберите тип поиска:",
+        "history_text": "📜 **Последние 10 поисков:**\n\n{history}",
+        "enter_text": "📝 Введите текст для проверки:",
+        "enter_url": "🔗 Введите URL сайта:"
+    },
+    "en": {
+        "start": "🤖 Hello! I'm OSINT Power Bot v10.0\n\n🔍 EXACT search:\n• By phone number\n• By full name\n• By email\n• By partial data\n\n🇷🇺🇺🇦🇰🇿🇧🇾🇲🇩 Search by country\n\nChoose language:",
+        "main_menu": "🔍 Main menu\n\nChoose function:",
+        "search_by_country": "🌍 Search by country",
+        "search_partial": "🔍 Partial data search",
+        "search_phone": "📞 EXACT phone search",
+        "search_fio": "👤 EXACT name search",
+        "search_email": "📧 EXACT email search",
+        "phone_analyze": "📊 Phone analysis",
+        "factcheck": "✅ Fact check",
+        "google_dork": "🔎 Google Dork",
+        "webarchive": "📁 WebArchive",
+        "activate_promo": "🔐 Activate promo",
+        "change_lang": "🌍 Change language",
+        "info": "ℹ️ Info",
+        "history": "📜 Search history",
+        "enter_phone": "📞 Enter phone number:",
+        "enter_fio": "👤 Enter full name:",
+        "enter_email": "📧 Enter email:",
+        "enter_lastname": "📝 Enter last name:",
+        "enter_firstname": "📝 Enter first name:",
+        "enter_middlename": "📝 Enter middle name:",
+        "enter_birthday": "📅 Enter birth date:",
+        "enter_age": "🎂 Enter age:",
+        "enter_birthplace": "🏠 Enter birthplace:",
+        "not_found": "❌ No EXACT matches found",
+        "found_exact": "✅ Found EXACT matches: {count}\n\n",
+        "promo_required": "❌ This function is paid. Enter promo code:",
+        "promo_used": "❌ Promo code already used",
+        "promo_invalid": "❌ Invalid promo code",
+        "promo_activated": "✅ Promo code activated for 30 days!",
+        "lang_changed": "🌍 Language changed",
+        "back": "◀️ Back",
+        "searching": "🔍 EXACT search: {query} in {country}...",
+        "select_country": "🌍 Select country:",
+        "select_search_type": "🔍 Select search type:",
+        "history_text": "📜 **Last 10 searches:**\n\n{history}",
+        "enter_text": "📝 Enter text to check:",
+        "enter_url": "🔗 Enter website URL:"
+    }
+}
+
+def get_text(user_id, key, **kwargs):
+    user = get_user(user_id)
+    lang = user["language"] if user else "uk"
+    text = LANGUAGES.get(lang, LANGUAGES["uk"]).get(key, key)
+    if kwargs:
+        text = text.format(**kwargs)
+    return text
+
+# =============== ПРОМОКОДИ ===============
+PROMOCODES_FILE = "promocodes.json"
+
+def load_promocodes():
+    if os.path.exists(PROMOCODES_FILE):
+        with open(PROMOCODES_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    promocodes = {}
+    for i in range(50):
+        code = secrets.token_hex(4).upper()
+        promocodes[code] = {"used": False, "used_by": None, "created_at": datetime.now().isoformat()}
+    save_promocodes(promocodes)
+    return promocodes
+
+def save_promocodes(promocodes):
+    with open(PROMOCODES_FILE, "w", encoding='utf-8') as f:
+        json.dump(promocodes, f, indent=2, ensure_ascii=False)
+
+promocodes = load_promocodes()
+
+# =============== ФОРМАТУВАННЯ ===============
+def format_exact_result(row):
+    if not row:
+        return None
+    
+    result = ""
+    phone_pattern = r'[+]?\d{9,12}'
+    name_pattern = r'[А-ЯЁІЇЄ][а-яёіїє]+\s+[А-ЯЁІЇЄ][а-яёіїє]+'
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    
+    for cell in row:
+        cell_str = str(cell).strip()
+        if re.match(phone_pattern, cell_str):
+            result += f"📞 {cell_str}\n"
+        elif re.match(name_pattern, cell_str):
+            result += f"👤 {cell_str}\n"
+        elif re.match(email_pattern, cell_str):
+            result += f"📧 {cell_str}\n"
+        elif cell_str and len(cell_str) > 2:
+            result += f"ℹ️ {cell_str}\n"
+    
+    return result if result else "📋 " + ", ".join(str(cell) for cell in row[:3])
+
+# =============== СОСТОЯНИЯ ===============
+class SearchStates(StatesGroup):
+    waiting_country = State()
+    waiting_search_type = State()
+    waiting_phone = State()
+    waiting_fio = State()
+    waiting_email = State()
+    waiting_partial_lastname = State()
+    waiting_partial_firstname = State()
+    waiting_partial_middlename = State()
+    waiting_partial_birthday = State()
+    waiting_partial_age = State()
+    waiting_partial_birthplace = State()
+    waiting_promo = State()
+    waiting_phone_analyze = State()
+    waiting_factcheck = State()
+    waiting_dork = State()
+    waiting_url = State()
+
+# =============== КЛАВИАТУРИ ===============
+def main_menu(user_id):
+    buttons = [
+        [InlineKeyboardButton(text=get_text(user_id, "search_by_country"), callback_data="search_by_country")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_partial"), callback_data="search_partial")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_phone"), callback_data="search_phone")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_fio"), callback_data="search_fio")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_email"), callback_data="search_email")],
+        [InlineKeyboardButton(text=get_text(user_id, "phone_analyze"), callback_data="phone_analyze")],
+        [InlineKeyboardButton(text=get_text(user_id, "factcheck"), callback_data="factcheck")],
+        [InlineKeyboardButton(text=get_text(user_id, "google_dork"), callback_data="google_dork")],
+        [InlineKeyboardButton(text=get_text(user_id, "webarchive"), callback_data="webarchive")],
+        [InlineKeyboardButton(text=get_text(user_id, "activate_promo"), callback_data="activate_promo")],
+        [InlineKeyboardButton(text=get_text(user_id, "history"), callback_data="history")],
+        [InlineKeyboardButton(text=get_text(user_id, "change_lang"), callback_data="change_lang")],
+        [InlineKeyboardButton(text=get_text(user_id, "info"), callback_data="info")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def country_menu(user_id):
+    buttons = []
+    for code, country in COUNTRIES.items():
+        buttons.append([InlineKeyboardButton(text=country["name"], callback_data=f"country_{code}")])
+    buttons.append([InlineKeyboardButton(text=get_text(user_id, "back"), callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def lang_menu():
+    buttons = [
+        [InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang_uk")],
+        [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")],
+        [InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def search_type_menu(user_id, country_code):
+    buttons = [
+        [InlineKeyboardButton(text="📞 ТОЧНИЙ пошук за номером", callback_data=f"st_phone_{country_code}")],
+        [InlineKeyboardButton(text="👤 ТОЧНИЙ пошук за ФІО", callback_data=f"st_fio_{country_code}")],
+        [InlineKeyboardButton(text="📧 ТОЧНИЙ пошук за Email", callback_data=f"st_email_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "back"), callback_data="back_to_countries")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# =============== ОБРОБНИКИ ===============
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    if not user:
+        save_user(user_id)
+        await message.answer(get_text(user_id, "start"), reply_markup=lang_menu())
+    else:
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+@dp.callback_query(lambda c: c.data.startswith("lang_"))
+async def change_language(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    lang = callback.data.split("_")[1]
+    update_user_language(user_id, lang)
+    await callback.message.edit_text(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "change_lang")
+async def change_lang_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.message.edit_text("🌍 Оберіть мову:", reply_markup=lang_menu())
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await state.clear()
+    await callback.message.edit_text(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "back_to_countries")
+async def back_to_countries(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await state.clear()
+    await callback.message.edit_text(get_text(user_id, "select_country"), reply_markup=country_menu(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "search_by_country")
+async def search_by_country(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(get_text(user_id, "select_country"), reply_markup=country_menu(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "search_phone")
+async def search_phone_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(get_text(user_id, "select_country"))
+    await state.set_state(SearchStates.waiting_country)
+    await state.update_data(search_type="phone")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "search_fio")
+async def search_fio_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(get_text(user_id, "select_country"))
+    await state.set_state(SearchStates.waiting_country)
+    await state.update_data(search_type="fio")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "search_email")
+async def search_email_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    if not check_promo_valid(user_id):
+        await callback.message.edit_text(get_text(user_id, "promo_required"))
+        await state.set_state(SearchStates.waiting_promo)
+        await state.update_data(next_action="email")
+        await callback.answer()
+        return
+    await callback.message.edit_text(get_text(user_id, "select_country"))
+    await state.set_state(SearchStates.waiting_country)
+    await state.update_data(search_type="email")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("country_"))
+async def select_country(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    country_code = callback.data.split("_")[1]
+    data = await state.get_data()
+    search_type = data.get("search_type")
+    
+    await state.update_data(country=country_code)
+    
+    if search_type:
+        if search_type == "phone":
+            await callback.message.edit_text(get_text(user_id, "enter_phone"))
+            await state.set_state(SearchStates.waiting_phone)
+        elif search_type == "fio":
+            await callback.message.edit_text(get_text(user_id, "enter_fio"))
+            await state.set_state(SearchStates.waiting_fio)
+        elif search_type == "email":
+            await callback.message.edit_text(get_text(user_id, "enter_email"))
+            await state.set_state(SearchStates.waiting_email)
+    else:
+        await callback.message.edit_text(
+            get_text(user_id, "select_search_type"),
+            reply_markup=search_type_menu(user_id, country_code)
+        )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("st_"))
+async def select_search_type(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    parts = callback.data.split("_")
+    search_type = parts[1]
+    country_code = parts[2]
+    
+    await state.update_data(country=country_code)
+    
+    if search_type == "phone":
+        await callback.message.edit_text(get_text(user_id, "enter_phone"))
+        await state.set_state(SearchStates.waiting_phone)
+    elif search_type == "fio":
+        await callback.message.edit_text(get_text(user_id, "enter_fio"))
+        await state.set_state(SearchStates.waiting_fio)
+    elif search_type == "email":
+        if not check_promo_valid(user_id):
+            await callback.message.edit_text(get_text(user_id, "promo_required"))
+            await state.set_state(SearchStates.waiting_promo)
+            await state.update_data(next_action="email", country=country_code)
+            await callback.answer()
+            return
+        await callback.message.edit_text(get_text(user_id, "enter_email"))
+        await state.set_state(SearchStates.waiting_email)
+    
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_phone)
+async def exact_search_phone(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    phone = message.text.strip()
+    data = await state.get_data()
+    country_code = data.get("country")
+    
+    if not country_code:
+        await state.clear()
+        await message.answer(get_text(user_id, "select_country"), reply_markup=country_menu(user_id))
+        return
+    
+    country_name = COUNTRIES.get(country_code, {}).get("name", country_code)
+    await message.answer(get_text(user_id, "searching", query=phone, country=country_name))
+    
+    results = await asyncio.to_thread(db_searcher.exact_search_phone, country_code, phone)
+    increment_search_count(user_id)
+    add_search_history(user_id, phone, "phone", country_code, len(results))
+    
+    if results:
+        await message.answer(get_text(user_id, "found_exact", count=len(results)))
+        for row in results[:15]:
+            formatted = format_exact_result(row)
+            if formatted:
+                await message.answer(formatted)
+        if len(results) > 15:
+            await message.answer(f"📊 Показано 15 з {len(results)} результатів")
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+@dp.message(SearchStates.waiting_fio)
+async def exact_search_fio(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    fio = message.text.strip()
+    data = await state.get_data()
+    country_code = data.get("country")
+    
+    if not country_code:
+        await state.clear()
+        await message.answer(get_text(user_id, "select_country"), reply_markup=country_menu(user_id))
+        return
+    
+    if len(fio) < 3:
+        await message.answer("❌ Введіть мінімум 3 символи")
+        return
+    
+    country_name = COUNTRIES.get(country_code, {}).get("name", country_code)
+    await message.answer(get_text(user_id, "searching", query=fio, country=country_name))
+    
+    results = await asyncio.to_thread(db_searcher.exact_search_name, country_code, fio)
+    increment_search_count(user_id)
+    add_search_history(user_id, fio, "fio", country_code, len(results))
+    
+    if results:
+        await message.answer(get_text(user_id, "found_exact", count=len(results)))
+        for row in results[:15]:
+            formatted = format_exact_result(row)
+            if formatted:
+                await message.answer(formatted)
+        if len(results) > 15:
+            await message.answer(f"📊 Показано 15 з {len(results)} результатів")
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+@dp.message(SearchStates.waiting_email)
+async def exact_search_email(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    email = message.text.strip().lower()
+    data = await state.get_data()
+    country_code = data.get("country")
+    
+    if not country_code:
+        await state.clear()
+        await message.answer(get_text(user_id, "select_country"), reply_markup=country_menu(user_id))
+        return
+    
+    if '@' not in email:
+        await message.answer("❌ Введіть коректний email")
+        return
+    
+    country_name = COUNTRIES.get(country_code, {}).get("name", country_code)
+    await message.answer(get_text(user_id, "searching", query=email, country=country_name))
+    
+    results = await asyncio.to_thread(db_searcher.exact_search_email, country_code, email)
+    increment_search_count(user_id)
+    add_search_history(user_id, email, "email", country_code, len(results))
+    
+    if results:
+        await message.answer(get_text(user_id, "found_exact", count=len(results)))
+        for row in results[:15]:
+            formatted = format_exact_result(row)
+            if formatted:
+                await message.answer(formatted)
+        if len(results) > 15:
+            await message.answer(f"📊 Показано 15 з {len(results)} результатів")
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+# =============== ПОШУК ЗА НЕПОВНИМИ ДАНИМИ ===============
+@dp.callback_query(lambda c: c.data == "search_partial")
+async def partial_search_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if not check_promo_valid(user_id):
+        await callback.message.edit_text(get_text(user_id, "promo_required"))
+        await state.set_state(SearchStates.waiting_promo)
+        await state.update_data(next_action="partial")
+        await callback.answer()
+        return
+    
+    await callback.message.edit_text(get_text(user_id, "select_country"))
+    await state.set_state(SearchStates.waiting_country)
+    await state.update_data(search_type="partial")
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_country)
+async def partial_country_handler(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    search_type = data.get("search_type")
+    
+    if search_type == "partial":
+        country_code = None
+        for code, country in COUNTRIES.items():
+            if country["name"].lower() in message.text.lower() or code in message.text.lower():
+                country_code = code
+                break
+        
+        if not country_code:
+            await message.answer("❌ Оберіть країну з меню", reply_markup=country_menu(user_id))
+            return
+        
+        await state.update_data(country=country_code, partial_data={})
+        await message.answer("📝 Введіть прізвище (або '-' щоб пропустити):")
+        await state.set_state(SearchStates.waiting_partial_lastname)
+    else:
+        await message.answer("❌ Виберіть країну з меню", reply_markup=country_menu(user_id))
+
+@dp.message(SearchStates.waiting_partial_lastname)
+async def partial_lastname(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    partial_data = data.get("partial_data", {})
+    
+    if message.text.strip() not in ["-", "пропустити", "skip"]:
+        partial_data["lastname"] = message.text.strip()
+    
+    await state.update_data(partial_data=partial_data)
+    await message.answer("📝 Введіть ім'я (або '-' щоб пропустити):")
+    await state.set_state(SearchStates.waiting_partial_firstname)
+
+@dp.message(SearchStates.waiting_partial_firstname)
+async def partial_firstname(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    partial_data = data.get("partial_data", {})
+    
+    if message.text.strip() not in ["-", "пропустити", "skip"]:
+        partial_data["firstname"] = message.text.strip()
+    
+    await state.update_data(partial_data=partial_data)
+    await message.answer("📝 Введіть по батькові (або '-' щоб пропустити):")
+    await state.set_state(SearchStates.waiting_partial_middlename)
+
+@dp.message(SearchStates.waiting_partial_middlename)
+async def partial_middlename(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    partial_data = data.get("partial_data", {})
+    
+    if message.text.strip() not in ["-", "пропустити", "skip"]:
+        partial_data["middlename"] = message.text.strip()
+    
+    await state.update_data(partial_data=partial_data)
+    await message.answer("📅 Введіть дату народження (ДД.ММ.РРРР) (або '-'):")
+    await state.set_state(SearchStates.waiting_partial_birthday)
+
+@dp.message(SearchStates.waiting_partial_birthday)
+async def partial_birthday(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    partial_data = data.get("partial_data", {})
+    
+    if message.text.strip() not in ["-", "пропустити", "skip"]:
+        partial_data["birthday"] = message.text.strip()
+    
+    await state.update_data(partial_data=partial_data)
+    await message.answer("🎂 Введіть вік (або '-'):")
+    await state.set_state(SearchStates.waiting_partial_age)
+
+@dp.message(SearchStates.waiting_partial_age)
+async def partial_age(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    partial_data = data.get("partial_data", {})
+    
+    if message.text.strip() not in ["-", "пропустити", "skip"]:
+        partial_data["age"] = message.text.strip()
+    
+    await state.update_data(partial_data=partial_data)
+    await message.answer("🏠 Введіть місце народження (або '-'):")
+    await state.set_state(SearchStates.waiting_partial_birthplace)
+
+@dp.message(SearchStates.waiting_partial_birthplace)
+async def partial_birthplace(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    partial_data = data.get("partial_data", {})
+    country_code = data.get("country")
+    
+    if message.text.strip() not in ["-", "пропустити", "skip"]:
+        partial_data["birthplace"] = message.text.strip()
+    
+    search_data = {k: v for k, v in partial_data.items() if v}
+    
+    if len(search_data) < 1:
+        await message.answer("❌ Введіть хоча б одне поле для пошуку")
+        await state.clear()
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+        return
+    
+    country_name = COUNTRIES.get(country_code, {}).get("name", country_code)
+    query_str = " + ".join(search_data.values())
+    await message.answer(get_text(user_id, "searching", query=query_str, country=country_name))
+    
+    results = await asyncio.to_thread(db_searcher.partial_search_exact, country_code, **search_data)
+    increment_search_count(user_id)
+    add_search_history(user_id, query_str, "partial", country_code, len(results))
+    
+    if results:
+        await message.answer(get_text(user_id, "found_exact", count=len(results)))
+        for row in results[:15]:
+            formatted = format_exact_result(row)
+            if formatted:
+                await message.answer(formatted)
+        if len(results) > 15:
+            await message.answer(f"📊 Показано 15 з {len(results)} результатів")
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+# =============== ІНШІ ФУНКЦІЇ ===============
+@dp.callback_query(lambda c: c.data == "phone_analyze")
+async def phone_analyze_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(get_text(user_id, "enter_phone"))
+    await state.set_state(SearchStates.waiting_phone_analyze)
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_phone_analyze)
+async def phone_analyze(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    phone = message.text.strip()
+    
+    try:
+        parsed = phonenumbers.parse(phone, None)
+        if not phonenumbers.is_valid_number(parsed):
+            await message.answer("❌ Невірний формат номера")
+        else:
+            country = geocoder.description_for_number(parsed, "ru")
+            operator = carrier.name_for_number(parsed, "ru")
+            result = f"📊 Аналіз номера\n\n📞 {phone}\n🌍 {country}\n📡 {operator if operator else 'Не визначено'}"
+            await message.answer(result)
+    except Exception as e:
+        await message.answer(f"❌ Помилка: {str(e)[:100]}")
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+@dp.callback_query(lambda c: c.data == "factcheck")
+async def factcheck_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(get_text(user_id, "enter_text"))
+    await state.set_state(SearchStates.waiting_factcheck)
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_factcheck)
+async def factcheck(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    
+    if len(text) < 10:
+        await message.answer("❌ Занадто короткий текст")
+    elif not ai_enabled:
+        await message.answer("❌ AI функції тимчасово недоступні")
+    else:
+        await message.answer("🧠 Аналізую...")
+        try:
+            response = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": f"Перевір факт: {text}"}]
+            )
+            await message.answer(f"✅ Результат:\n\n{response.choices[0].message.content}")
+        except Exception as e:
+            await message.answer(f"❌ Помилка: {str(e)[:100]}")
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+@dp.callback_query(lambda c: c.data == "google_dork")
+async def dork_menu_handler(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    buttons = [
+        [InlineKeyboardButton(text="👤 Пошук людини", callback_data="dork_person")],
+        [InlineKeyboardButton(text="📧 Пошук email", callback_data="dork_email")],
+        [InlineKeyboardButton(text="📂 Документи", callback_data="dork_docs")],
+        [InlineKeyboardButton(text=get_text(user_id, "back"), callback_data="back_to_main")]
+    ]
+    await callback.message.edit_text("🔎 Google Dork", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("dork_"))
+async def dork_type_handler(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    dork_type = callback.data.split("_")[1]
+    await state.update_data(dork_type=dork_type)
+    
+    prompts = {
+        "person": "👤 Введіть username:",
+        "email": "📧 Введіть email або домен:",
+        "docs": "📂 Введіть ключове слово:"
+    }
+    await callback.message.edit_text(prompts.get(dork_type, "Введіть запит:"))
+    await state.set_state(SearchStates.waiting_dork)
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_dork)
+async def process_dork(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    dork_type = data.get("dork_type", "person")
+    
+    templates = {
+        "person": [f'"{query}" site:instagram.com', f'"{query}" site:t.me', f'"{query}" site:facebook.com'],
+        "email": [f'"{query}" filetype:pdf', f'"{query}" site:pastebin.com'],
+        "docs": [f'filetype:pdf "{query}"', f'filetype:xls "{query}"', f'filetype:doc "{query}"']
+    }
+    
+    dorks = templates.get(dork_type, [])
+    result_text = f"🔎 Google Dork для {query}\n\n" + "\n".join(dorks)
+    await message.answer(result_text[:4000])
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+@dp.callback_query(lambda c: c.data == "webarchive")
+async def webarchive_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(get_text(user_id, "enter_url"))
+    await state.set_state(SearchStates.waiting_url)
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_url)
+async def webarchive_check(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    url = message.text.strip()
+    await message.answer("📁 Шукаю архів...")
+    
+    try:
+        encoded_url = urllib.parse.quote(url, safe='')
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://archive.org/wayback/available?url={encoded_url}", timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("archived_snapshots"):
+                        await message.answer(f"📁 Архів: {data['archived_snapshots']['closest']['url']}")
+                    else:
+                        await message.answer("❌ Архівів не знайдено")
+                else:
+                    await message.answer("❌ Помилка")
+    except Exception as e:
+        await message.answer(f"❌ {str(e)[:100]}")
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+@dp.callback_query(lambda c: c.data == "activate_promo")
+async def activate_promo_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(get_text(user_id, "enter_promo"))
+    await state.set_state(SearchStates.waiting_promo)
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_promo)
+async def process_promo(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    code = message.text.strip().upper()
+    data = await state.get_data()
+    next_action = data.get("next_action", "menu")
+    country = data.get("country")
+    
+    if code not in promocodes:
+        await message.answer(get_text(user_id, "promo_invalid"))
+    elif promocodes[code]["used"]:
+        await message.answer(get_text(user_id, "promo_used"))
+    else:
+        promocodes[code]["used"] = True
+        promocodes[code]["used_by"] = user_id
+        save_promocodes(promocodes)
+        update_user_promo(user_id, code, 30)
+        expiry = (datetime.now() + timedelta(days=30)).strftime("%d.%m.%Y")
+        await message.answer(get_text(user_id, "promo_activated") + f"\n📅 Дійсний до: {expiry}")
+    
+    await state.clear()
+    
+    if next_action == "partial":
+        await message.answer(get_text(user_id, "select_country"), reply_markup=country_menu(user_id))
+        await state.set_state(SearchStates.waiting_country)
+        await state.update_data(search_type="partial")
+    elif next_action == "email" and country:
+        await message.answer(get_text(user_id, "enter_email"))
+        await state.set_state(SearchStates.waiting_email)
+        await state.update_data(country=country)
+    else:
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+@dp.callback_query(lambda c: c.data == "history")
+async def show_history(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT query, query_type, country, result_count, search_date 
+        FROM search_history 
+        WHERE user_id = ? 
+        ORDER BY search_date DESC 
+        LIMIT 10
+    ''', (user_id,))
+    history = cursor.fetchall()
+    conn.close()
+    
+    if history:
+        history_text = ""
+        for i, row in enumerate(history, 1):
+            country_name = COUNTRIES.get(row[2], {}).get("name", row[2])
+            date = datetime.fromisoformat(row[4]).strftime("%d.%m %H:%M")
+            history_text += f"{i}. {row[0]} ({country_name}) - {row[3]} знайдено [{date}]\n"
+        await callback.message.edit_text(get_text(user_id, "history_text", history=history_text), reply_markup=main_menu(user_id))
+    else:
+        await callback.message.edit_text("📜 Історія порожня", reply_markup=main_menu(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "info")
+async def bot_info(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user = get_user(user_id)
+    
+    total_files = 0
+    for code in COUNTRIES:
+        total_files += len(db_searcher.get_files_for_country(code))
+    
+    info_text = (
+        "🤖 OSINT Power Bot v10.0\n\n"
+        "🔍 **ТОЧНИЙ ПОШУК:**\n"
+        "• За номером телефону\n"
+        "• За ФІО (повний збіг)\n"
+        "• За Email\n"
+        "• За неповними даними\n\n"
+        "🇷🇺🇺🇦🇰🇿🇧🇾🇲🇩 Пошук по 5 країнах\n\n"
+        f"📁 Всього файлів: {total_files}\n"
+        f"🔍 Ваших пошуків: {user['search_count'] if user else 0}\n\n"
+        "💡 /start - Головне меню\n\n"
+        "⚠️ Дані з відкритих джерел"
+    )
+    await callback.message.edit_text(info_text, reply_markup=main_menu(user_id))
+    await callback.answer()
+
+# =============== ЗАПУСК ===============
+async def main():
+    print("=" * 60)
+    print("🤖 OSINT Power Bot v10.0 - ТОЧНИЙ ПОШУК ПО КРАЇНАХ")
+    print("=" * 60)
+    print(f"📁 Папка з базами: {os.path.abspath(DATABASES_DIR)}")
+    print("📂 Структура папок:")
+    for code, country in COUNTRIES.items():
+        folder = os.path.join(DATABASES_DIR, country["folder"])
+        files = db_searcher.get_files_for_country(code)
+        print(f"   {country['name']}: {len(files)} файлів")
+    print("=" * 60)
+    print("✅ Бот запущено!")
+    print("=" * 60)
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
