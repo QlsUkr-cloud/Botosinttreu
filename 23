@@ -1,0 +1,549 @@
+import asyncio
+import logging
+import os
+import re
+import json
+import secrets
+import csv
+import glob
+import random
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
+
+# =============== ЗАГРУЗКА ТОКЕНОВ ===============
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "8640510286"))
+
+if not BOT_TOKEN:
+    print("❌ ОШИБКА: Проверь .env файл!")
+    exit(1)
+
+print("✅ Токен загружен успешно!")
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# =============== НАЛАШТУВАННЯ ===============
+DATABASES_DIR = "database"
+LANGUAGE_FILE = "language.json"
+
+if not os.path.exists(DATABASES_DIR):
+    os.makedirs(DATABASES_DIR)
+
+# =============== МОВИ ===============
+LANGUAGES = {
+    "uk": {
+        "start": "🤖 Вітаю! Я бот для пошуку інформації\n\nОберіть мову / Вибери язык / Choose language",
+        "main_menu": "🔍 Головне меню\n\nОберіть функцію:",
+        "search_fio": "👤 Пошук по ФІО",
+        "search_gmail": "📧 Пошук по Gmail",
+        "search_passport": "🆔 Пошук по паспорту/ІІН",
+        "search_card": "💳 Пошук по карті",
+        "change_lang": "🌍 Змінити мову",
+        "info": "ℹ️ Інфо",
+        "enter_fio": "Введіть ФІО для пошуку:",
+        "enter_gmail": "Введіть Gmail для пошуку:",
+        "enter_passport": "Введіть номер паспорту або ІІН:",
+        "enter_card": "Введіть номер банківської картки:",
+        "not_found": "❌ Нічого не знайдено",
+        "found": "✅ Знайдено інформацію:\n\n",
+        "promo_required": "❌ Ця функція платна. Введіть промокод:",
+        "promo_used": "❌ Промокод вже використано",
+        "promo_invalid": "❌ Невірний промокод",
+        "promo_activated": "✅ Промокод активовано!",
+        "no_promo": "❌ У вас немає активного промокоду",
+        "promo_enter": "🔐 Введіть промокод:",
+        "lang_changed": "🌍 Мову змінено на українську",
+        "card_number": "💳 Номер картки:",
+        "card_bank": "🏦 Банк:",
+        "card_date": "📅 Термін дії:",
+        "card_holder": "👤 Власник:"
+    },
+    "ru": {
+        "start": "🤖 Привет! Я бот для поиска информации\n\nВыберите язык / Оберіть мову / Choose language",
+        "main_menu": "🔍 Главное меню\n\nВыберите функцию:",
+        "search_fio": "👤 Поиск по ФИО",
+        "search_gmail": "📧 Поиск по Gmail",
+        "search_passport": "🆔 Поиск по паспорту/ИИН",
+        "search_card": "💳 Поиск по карте",
+        "change_lang": "🌍 Сменить язык",
+        "info": "ℹ️ Инфо",
+        "enter_fio": "Введите ФИО для поиска:",
+        "enter_gmail": "Введите Gmail для поиска:",
+        "enter_passport": "Введите номер паспорта или ИИН:",
+        "enter_card": "Введите номер банковской карты:",
+        "not_found": "❌ Ничего не найдено",
+        "found": "✅ Найдена информация:\n\n",
+        "promo_required": "❌ Эта функция платная. Введите промокод:",
+        "promo_used": "❌ Промокод уже использован",
+        "promo_invalid": "❌ Неверный промокод",
+        "promo_activated": "✅ Промокод активирован!",
+        "no_promo": "❌ У вас нет активного промокода",
+        "promo_enter": "🔐 Введите промокод:",
+        "lang_changed": "🌍 Язык изменен на русский",
+        "card_number": "💳 Номер карты:",
+        "card_bank": "🏦 Банк:",
+        "card_date": "📅 Срок действия:",
+        "card_holder": "👤 Владелец:"
+    },
+    "en": {
+        "start": "🤖 Hello! I'm a search bot\n\nChoose language / Оберіть мову / Выберите язык",
+        "main_menu": "🔍 Main menu\n\nChoose function:",
+        "search_fio": "👤 Search by name",
+        "search_gmail": "📧 Search by Gmail",
+        "search_passport": "🆔 Search by passport/IIN",
+        "search_card": "💳 Search by card",
+        "change_lang": "🌍 Change language",
+        "info": "ℹ️ Info",
+        "enter_fio": "Enter full name to search:",
+        "enter_gmail": "Enter Gmail to search:",
+        "enter_passport": "Enter passport number or IIN:",
+        "enter_card": "Enter bank card number:",
+        "not_found": "❌ Nothing found",
+        "found": "✅ Information found:\n\n",
+        "promo_required": "❌ This function is paid. Enter promo code:",
+        "promo_used": "❌ Promo code already used",
+        "promo_invalid": "❌ Invalid promo code",
+        "promo_activated": "✅ Promo code activated!",
+        "no_promo": "❌ You don't have an active promo code",
+        "promo_enter": "🔐 Enter promo code:",
+        "lang_changed": "🌍 Language changed to English",
+        "card_number": "💳 Card number:",
+        "card_bank": "🏦 Bank:",
+        "card_date": "📅 Expiry date:",
+        "card_holder": "👤 Holder:"
+    }
+}
+
+# =============== ЗБЕРІГАННЯ МОВИ ===============
+def load_language(user_id):
+    if os.path.exists(LANGUAGE_FILE):
+        with open(LANGUAGE_FILE, "r", encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get(str(user_id), "uk")
+    return "uk"
+
+def save_language(user_id, lang):
+    data = {}
+    if os.path.exists(LANGUAGE_FILE):
+        with open(LANGUAGE_FILE, "r", encoding='utf-8') as f:
+            data = json.load(f)
+    data[str(user_id)] = lang
+    with open(LANGUAGE_FILE, "w", encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_text(user_id, key):
+    lang = load_language(user_id)
+    return LANGUAGES.get(lang, LANGUAGES["uk"]).get(key, key)
+
+# =============== ПРОМОКОДИ ===============
+PROMOCODES_FILE = "promocodes.json"
+
+def load_promocodes():
+    if os.path.exists(PROMOCODES_FILE):
+        with open(PROMOCODES_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    promocodes = {}
+    for i in range(50):
+        code = secrets.token_hex(4).upper()
+        promocodes[code] = {"used": False, "used_by": None}
+    save_promocodes(promocodes)
+    return promocodes
+
+def save_promocodes(promocodes):
+    with open(PROMOCODES_FILE, "w", encoding='utf-8') as f:
+        json.dump(promocodes, f, indent=2, ensure_ascii=False)
+
+promocodes = load_promocodes()
+
+# =============== АКТИВНІ ПРОМОКОДИ ДЛЯ КОРИСТУВАЧІВ ===============
+user_promocodes = {}
+
+# =============== ФЕЙКОВІ ДАНІ ДЛЯ ПОШУКУ ===============
+FAKE_DATA = {
+    "fio": {
+        "іван петров": {"phone": "+380991234567", "address": "м. Київ, вул. Хрещатик 1", "birth": "15.03.1985"},
+        "петро іванов": {"phone": "+380992345678", "address": "м. Львів, вул. Свободи 2", "birth": "22.07.1990"},
+        "марія шевченко": {"phone": "+380993456789", "address": "м. Одеса, вул. Дерибасівська 3", "birth": "10.12.1988"},
+        "андрій коваленко": {"phone": "+380994567890", "address": "м. Дніпро, пр. Яворницького 4", "birth": "05.05.1995"},
+        "оксана бондар": {"phone": "+380995678901", "address": "м. Харків, вул. Сумська 5", "birth": "30.08.1992"},
+        "олег клименко": {"phone": "+380996789012", "address": "м. Запоріжжя, пр. Соборний 6", "birth": "17.11.1987"},
+        "наталія мороз": {"phone": "+380997890123", "address": "м. Вінниця, вул. Соборна 7", "birth": "25.04.1993"},
+        "сергій лисенко": {"phone": "+380998901234", "address": "м. Полтава, вул. Європейська 8", "birth": "08.09.1986"},
+        "юлія савченко": {"phone": "+380999012345", "address": "м. Чернівці, вул. Головна 9", "birth": "14.02.1991"},
+        "микола тимошенко": {"phone": "+380999123456", "address": "м. Рівне, вул. Незалежності 10", "birth": "29.06.1989"},
+        "алексей генадович": {"phone": "+79222809644", "address": "м. Москва, вул. Тверська 11", "birth": "13.01.2019", "region": "YamalNenetsAO"},
+    },
+    "gmail": {
+        "test@gmail.com": {"name": "Тестовий Користувач", "phone": "+380991234567", "registered": "2023-01-15"},
+        "user@ukr.net": {"name": "Звичайний Користувач", "phone": "+380992345678", "registered": "2023-02-20"},
+        "example@gmail.com": {"name": "Приклад Користувач", "phone": "+380993456789", "registered": "2023-03-10"},
+        "info@email.com": {"name": "Інформаційний Користувач", "phone": "+380994567890", "registered": "2023-04-05"},
+    },
+    "passport": {
+        "AA123456": {"name": "Іван Петров", "birth": "15.03.1985", "issued": "2020-01-10"},
+        "BB654321": {"name": "Петро Іванов", "birth": "22.07.1990", "issued": "2019-06-15"},
+        "123456789012": {"name": "Марія Шевченко", "birth": "10.12.1988", "type": "ІІН"},
+        "987654321098": {"name": "Андрій Коваленко", "birth": "05.05.1995", "type": "ІІН"},
+    },
+    "cards": {
+        "5168743210123456": {"bank": "ПриватБанк", "expiry": "12/26", "holder": "ІВАН ПЕТРОВ"},
+        "4149632012345678": {"bank": "Монобанк", "expiry": "08/25", "holder": "ПЕТРО ІВАНОВ"},
+        "5375411234567890": {"bank": "Ощадбанк", "expiry": "03/27", "holder": "МАРІЯ ШЕВЧЕНКО"},
+        "4556123498765432": {"bank": "А-Банк", "expiry": "06/24", "holder": "АНДРІЙ КОВАЛЕНКО"},
+        "5280412345678901": {"bank": "Райффайзен", "expiry": "09/28", "holder": "ОКСАНА БОНДАР"},
+        "5486732198765430": {"bank": "Укрсиббанк", "expiry": "11/25", "holder": "ОЛЕГ КЛИМЕНКО"},
+        "4029364712345678": {"bank": "ПУМБ", "expiry": "02/26", "holder": "НАТАЛІЯ МОРОЗ"},
+    }
+}
+
+# =============== ПОШУКОВІ ФУНКЦІЇ ===============
+def search_by_fio(query):
+    query_lower = query.lower()
+    for name, data in FAKE_DATA["fio"].items():
+        if query_lower in name:
+            return {"name": name.title(), **data}
+    return None
+
+def search_by_gmail(query):
+    query_lower = query.lower()
+    for email, data in FAKE_DATA["gmail"].items():
+        if query_lower in email:
+            return {"email": email, **data}
+    return None
+
+def search_by_passport(query):
+    query_upper = query.upper()
+    for passport, data in FAKE_DATA["passport"].items():
+        if query_upper == passport.upper() or query_upper in passport.upper():
+            return {"passport": passport, **data}
+    return None
+
+def search_by_card(query):
+    query_clean = re.sub(r'\D', '', query)
+    for card, data in FAKE_DATA["cards"].items():
+        if query_clean == card or query_clean in card or card.endswith(query_clean[-4:]):
+            return {"card": card, **data}
+    return None
+
+# =============== СОСТОЯНИЯ ===============
+class SearchStates(StatesGroup):
+    waiting_fio = State()
+    waiting_gmail = State()
+    waiting_passport = State()
+    waiting_card = State()
+    waiting_promo = State()
+
+# =============== КЛАВИАТУРИ ===============
+def main_menu(user_id):
+    buttons = [
+        [InlineKeyboardButton(text=get_text(user_id, "search_fio"), callback_data="search_fio")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_gmail"), callback_data="search_gmail")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_passport"), callback_data="search_passport")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_card"), callback_data="search_card")],
+        [InlineKeyboardButton(text=get_text(user_id, "change_lang"), callback_data="change_lang")],
+        [InlineKeyboardButton(text=get_text(user_id, "info"), callback_data="info")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def lang_menu():
+    buttons = [
+        [InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang_uk")],
+        [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")],
+        [InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# =============== ОБРОБНИК /start ===============
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    await message.answer(
+        get_text(user_id, "start"),
+        reply_markup=lang_menu()
+    )
+
+# =============== ЗМІНА МОВИ ===============
+@dp.callback_query(lambda c: c.data.startswith("lang_"))
+async def change_language(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    lang = callback.data.split("_")[1]
+    save_language(user_id, lang)
+    
+    await callback.message.edit_text(
+        get_text(user_id, "lang_changed"),
+        reply_markup=main_menu(user_id)
+    )
+    await callback.answer()
+
+# =============== ГОЛОВНЕ МЕНЮ ===============
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        get_text(user_id, "main_menu"),
+        reply_markup=main_menu(user_id)
+    )
+    await callback.answer()
+
+# =============== ІНФО ===============
+@dp.callback_query(lambda c: c.data == "info")
+async def show_info(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    info_text = (
+        "🤖 OSINT Power Bot v10.0\n\n"
+        "📌 Це навчальний/тестовий бот\n"
+        "⚠️ Всі дані є фейковими\n\n"
+        "🔍 Функції:\n"
+        "• Пошук по ФІО\n"
+        "• Пошук по Gmail (потрібен промокод)\n"
+        "• Пошук по паспорту/ІІН\n"
+        "• Пошук по банківській карті\n\n"
+        "💡 Для доступу до платних функцій потрібен промокод"
+    )
+    await callback.message.edit_text(info_text, reply_markup=main_menu(user_id))
+    await callback.answer()
+
+# =============== ПОШУК ПО ФІО ===============
+@dp.callback_query(lambda c: c.data == "search_fio")
+async def search_fio_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        get_text(user_id, "enter_fio"),
+        reply_markup=None
+    )
+    await state.set_state(SearchStates.waiting_fio)
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_fio)
+async def search_fio(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    
+    await message.answer(f"🔍 Шукаю {query}...")
+    
+    result = search_by_fio(query)
+    
+    if result:
+        response = get_text(user_id, "found")
+        response += f"👤 ФІО: {result['name']}\n"
+        response += f"📞 Телефон: {result['phone']}\n"
+        if 'address' in result:
+            response += f"📍 Адреса: {result['address']}\n"
+        if 'birth' in result:
+            response += f"📅 Дата народження: {result['birth']}\n"
+        if 'region' in result:
+            response += f"📍 Регіон: {result['region']}\n"
+        await message.answer(response)
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+# =============== ПОШУК ПО GMAIL (ПЛАТНИЙ) ===============
+@dp.callback_query(lambda c: c.data == "search_gmail")
+async def search_gmail_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if user_id not in user_promocodes:
+        await callback.message.edit_text(
+            get_text(user_id, "promo_required"),
+            reply_markup=None
+        )
+        await state.set_state(SearchStates.waiting_promo)
+        await state.update_data(next_action="gmail")
+        await callback.answer()
+        return
+    
+    await callback.message.edit_text(
+        get_text(user_id, "enter_gmail"),
+        reply_markup=None
+    )
+    await state.set_state(SearchStates.waiting_gmail)
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_gmail)
+async def search_gmail(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    
+    await message.answer(f"🔍 Шукаю {query}...")
+    
+    result = search_by_gmail(query)
+    
+    if result:
+        response = get_text(user_id, "found")
+        response += f"📧 Email: {result['email']}\n"
+        response += f"👤 Ім'я: {result['name']}\n"
+        response += f"📞 Телефон: {result['phone']}\n"
+        response += f"📅 Дата реєстрації: {result['registered']}\n"
+        await message.answer(response)
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+# =============== ПОШУК ПО ПАСПОРТУ/ІІН ===============
+@dp.callback_query(lambda c: c.data == "search_passport")
+async def search_passport_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        get_text(user_id, "enter_passport"),
+        reply_markup=None
+    )
+    await state.set_state(SearchStates.waiting_passport)
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_passport)
+async def search_passport(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    
+    await message.answer(f"🔍 Шукаю {query}...")
+    
+    result = search_by_passport(query)
+    
+    if result:
+        response = get_text(user_id, "found")
+        response += f"🆔 Документ: {result['passport']}\n"
+        response += f"👤 ПІБ: {result['name']}\n"
+        response += f"📅 Дата народження: {result['birth']}\n"
+        if 'issued' in result:
+            response += f"📅 Виданий: {result['issued']}\n"
+        if 'type' in result:
+            response += f"📋 Тип: {result['type']}\n"
+        await message.answer(response)
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+# =============== ПОШУК ПО КАРТІ ===============
+@dp.callback_query(lambda c: c.data == "search_card")
+async def search_card_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        get_text(user_id, "enter_card"),
+        reply_markup=None
+    )
+    await state.set_state(SearchStates.waiting_card)
+    await callback.answer()
+
+@dp.message(SearchStates.waiting_card)
+async def search_card(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    
+    await message.answer(f"🔍 Шукаю {query}...")
+    
+    result = search_by_card(query)
+    
+    if result:
+        response = get_text(user_id, "found")
+        response += f"{get_text(user_id, 'card_number')} {result['card'][:4]} {result['card'][4:8]} {result['card'][8:12]} {result['card'][12:16]}\n"
+        response += f"{get_text(user_id, 'card_bank')} {result['bank']}\n"
+        response += f"{get_text(user_id, 'card_date')} {result['expiry']}\n"
+        response += f"{get_text(user_id, 'card_holder')} {result['holder']}\n"
+        await message.answer(response)
+    else:
+        await message.answer(get_text(user_id, "not_found"))
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+# =============== АКТИВАЦІЯ ПРОМОКОДУ ===============
+@dp.message(SearchStates.waiting_promo)
+async def process_promo(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    code = message.text.strip().upper()
+    data = await state.get_data()
+    next_action = data.get("next_action", "gmail")
+    
+    if code not in promocodes:
+        await message.answer(get_text(user_id, "promo_invalid"))
+        await state.clear()
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+        return
+    
+    if promocodes[code]["used"]:
+        await message.answer(get_text(user_id, "promo_used"))
+        await state.clear()
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+        return
+    
+    promocodes[code]["used"] = True
+    promocodes[code]["used_by"] = user_id
+    save_promocodes(promocodes)
+    user_promocodes[user_id] = code
+    
+    await message.answer(get_text(user_id, "promo_activated"))
+    
+    if next_action == "gmail":
+        await message.answer(get_text(user_id, "enter_gmail"))
+        await state.set_state(SearchStates.waiting_gmail)
+    else:
+        await state.clear()
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=main_menu(user_id))
+
+# =============== ЗМІНА МОВИ З МЕНЮ ===============
+@dp.callback_query(lambda c: c.data == "change_lang")
+async def change_lang_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        "🌍 Оберіть мову / Выберите язык / Choose language:",
+        reply_markup=lang_menu()
+    )
+    await callback.answer()
+
+# =============== КОМАНДИ ДЛЯ ВЛАСНИКА ===============
+@dp.message(Command("gen_promo"))
+async def gen_promo(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("❌ Доступ заборонено")
+        return
+    
+    code = secrets.token_hex(4).upper()
+    promocodes[code] = {"used": False, "used_by": None}
+    save_promocodes(promocodes)
+    await message.answer(f"✅ Новий промокод: `{code}`\nВсього промокодів: {len(promocodes)}")
+
+@dp.message(Command("list_promo"))
+async def list_promo(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("❌ Доступ заборонено")
+        return
+    
+    used = [f"`{k}` - використав {v['used_by']}" for k, v in promocodes.items() if v["used"]]
+    unused = [f"`{k}`" for k, v in promocodes.items() if not v["used"]]
+    
+    result = "📋 **Промокоди:**\n\n"
+    result += f"✅ Використані ({len(used)}):\n" + ("\n".join(used) if used else "Немає") + "\n\n"
+    result += f"🟢 Не використані ({len(unused)}):\n" + ("\n".join(unused[:20]) if unused else "Немає")
+    
+    await message.answer(result[:4000])
+
+# =============== ЗАПУСК ===============
+async def main():
+    print("=" * 50)
+    print("🤖 OSINT Power Bot v10.0")
+    print("=" * 50)
+    print(f"📁 Папка з базами: {os.path.abspath(DATABASES_DIR)}")
+    print(f"📋 Промокодів: {len(promocodes)}")
+    print("=" * 50)
+    print("✅ Бот запущено!")
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
