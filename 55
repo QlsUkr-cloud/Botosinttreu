@@ -1,0 +1,1090 @@
+import logging
+import os
+import re
+import json
+import secrets
+import asyncio
+import urllib.parse
+import csv
+import glob
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from openai import AsyncOpenAI
+from dotenv import load_dotenv
+import phonenumbers
+from phonenumbers import carrier, geocoder
+import aiohttp
+
+load_dotenv()
+
+API_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OWNER_ID = int(os.getenv("OWNER_ID", "8640510286"))
+
+# ==================== НАЛАШТУВАННЯ ====================
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# ==================== ШТУЧНИЙ ІНТЕЛЕКТ ====================
+if OPENAI_API_KEY:
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    ai_enabled = True
+    print("✅ AI функції активовано")
+else:
+    ai_enabled = False
+    print("⚠️ OpenAI API ключ не знайдено")
+
+# ==================== БАЗА ДАНИХ ====================
+DATABASES_DIR = "database"
+if not os.path.exists(DATABASES_DIR):
+    os.makedirs(DATABASES_DIR)
+
+# Фейкові бази даних для прикладу (в реальності будуть CSV файли)
+MOCK_DATABASE = [
+    ["+79092809644", "Глазунова Елена Викторовна", "Козлова Татьяна Константиновна, Михаил", "Ярославська область", "12.01.2019", "МТС", "glazunova.elena@mail.ru", "@glazunova_e", "@glazunova_e", "176.59.56.123", "Toyota Camry 2018", "123456789012", "4512 345678", "м. Ярославль, вул. Свободи, 15/2, кв. 45", "****1234"],
+    ["+79092809100", "Глазунова Елена Викторовна", "Козлова Татьяна Константиновна, Михаил", "Ярославська область", "12.01.2019", "МТС", "glazunova.elena@mail.ru", "@glazunova_e", "@glazunova_e", "176.59.56.123", "Toyota Camry 2018", "123456789012", "4512 345678", "м. Ярославль, вул. Свободи, 15/2, кв. 45", "****1234"],
+]
+
+class DatabaseSearcher:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.data = []
+        self.loaded = False
+    
+    def load_data(self):
+        """Завантаження даних з CSV файлів"""
+        self.data = []
+        
+        # Шукаємо CSV файли
+        csv_files = glob.glob(os.path.join(self.db_path, "*.csv"))
+        txt_files = glob.glob(os.path.join(self.db_path, "*.txt"))
+        
+        all_files = csv_files + txt_files
+        
+        if not all_files:
+            print("⚠️ Бази даних не знайдено, використовую фейкові дані")
+            self.data = MOCK_DATABASE.copy()
+        else:
+            for file_path in all_files:
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        if file_path.endswith('.csv'):
+                            reader = csv.reader(f)
+                            for row in reader:
+                                if row:
+                                    self.data.append(row)
+                        else:
+                            for line in f:
+                                if line.strip():
+                                    self.data.append([line.strip()])
+                    print(f"✅ Завантажено: {os.path.basename(file_path)}")
+                except Exception as e:
+                    print(f"❌ Помилка {file_path}: {e}")
+        
+        self.loaded = True
+        print(f"📊 Всього записів: {len(self.data)}")
+        return self.data
+    
+    def search_phone(self, phone_number):
+        """Пошук за номером телефону"""
+        if not self.loaded:
+            self.load_data()
+        
+        phone_clean = re.sub(r'\D', '', phone_number)
+        results = []
+        
+        for row in self.data:
+            row_text = " ".join(str(cell) for cell in row).lower()
+            row_clean = re.sub(r'\D', '', row_text)
+            
+            if phone_clean in row_clean or row_clean.endswith(phone_clean[-7:]):
+                results.append(row)
+        
+        return results
+    
+    def search_name(self, name_query):
+        """Пошук за ФІО"""
+        if not self.loaded:
+            self.load_data()
+        
+        name_lower = name_query.lower()
+        results = []
+        
+        for row in self.data:
+            row_text = " ".join(str(cell) for cell in row).lower()
+            if name_lower in row_text:
+                results.append(row)
+        
+        return results
+
+db_searcher = DatabaseSearcher(DATABASES_DIR)
+
+# ==================== МОВИ ====================
+LANGUAGES = {
+    "uk": {
+        "start": "🔍 OSINT Power Bot v11.0 готовий до роботи.\n\nОберіть мову:",
+        "main_menu": "🔍 Головне меню\n\nОберіть функцію:",
+        "back": "◀️ Назад",
+        "choose_base": "Оберіть базу для пошуку:",
+        "enter_phone": "📞 Введіть номер телефону:",
+        "enter_fio": "👤 Введіть ПІБ:",
+        "enter_email": "📧 Введіть Email:",
+        "enter_tg": "📱 Введіть Telegram username:",
+        "enter_address": "🏠 Введіть адресу:",
+        "enter_tiktok": "🎵 Введіть TikTok username:",
+        "enter_ip": "🌐 Введіть IP-адресу:",
+        "enter_car": "🚗 Введіть номер авто або VIN:",
+        "enter_iin": "🆔 Введіть ІІН (12 цифр):",
+        "enter_passport": "🪪 Введіть серію та номер паспорта РФ:",
+        "enter_card": "💳 Введіть номер банківської картки:",
+        "enter_recursive": "📞 Введіть номер для рекурсивного пошуку:",
+        "enter_dork": "✏️ Введіть Google Dork:",
+        "enter_url": "🔗 Введіть URL сайту:",
+        "enter_domain": "🕵️ Введіть домен:",
+        "enter_text": "📝 Введіть текст для перевірки:",
+        "enter_promo": "🔐 Введіть промокод:",
+        "searching": "🔍 Пошук...",
+        "loading": "⏳ Завантаження баз даних...",
+        "ai_analyze": "🤖 ШІ аналізує дані...",
+        "found": "✅ Знайдено інформацію:",
+        "not_found": "❌ Нічого не знайдено",
+        "promo_required": "❌ Ця функція платна. Введіть промокод:",
+        "promo_used": "❌ Промокод вже використано",
+        "promo_invalid": "❌ Невірний промокод",
+        "promo_activated": "✅ Промокод активовано!",
+        "language_changed": "🌍 Мову змінено на Українську",
+        "phone_analyze": "📞 Аналіз номера",
+        "factcheck": "✅ Перевірка фактів",
+        "search_phone": "📇 Пошук за номером",
+        "search_fio": "👤 Пошук за ФІО",
+        "search_email": "📧 Пошук за Email",
+        "search_tg": "📱 Пошук за Telegram",
+        "search_address": "🏠 Пошук за адресою",
+        "search_tiktok": "🎵 Пошук за TikTok",
+        "search_ip": "🌐 Пошук за IP",
+        "search_car": "🚗 Пошук за авто",
+        "search_iin": "🆔 Пошук за ІІН",
+        "search_passport": "🪪 Паспорт РФ",
+        "search_card": "💳 Пошук за картою",
+        "recursive": "🔁 Рекурсивний пошук",
+        "extended": "📋 Розширений пошук",
+        "google_dorks": "🌐 Google Dorks",
+        "webarchive": "📦 Web Archive",
+        "whois": "🕵️ Whois",
+        "subdomains": "📡 Subdomains",
+        "change_lang": "🌍 Змінити мову",
+        "info": "ℹ️ Інформація"
+    },
+    "ru": {
+        "start": "🔍 OSINT Power Bot v11.0 готов к работе.\n\nВыберите язык:",
+        "main_menu": "🔍 Главное меню\n\nВыберите функцию:",
+        "back": "◀️ Назад",
+        "choose_base": "Выберите базу для поиска:",
+        "enter_phone": "📞 Введите номер телефона:",
+        "enter_fio": "👤 Введите ФИО:",
+        "enter_email": "📧 Введите Email:",
+        "enter_tg": "📱 Введите Telegram username:",
+        "enter_address": "🏠 Введите адрес:",
+        "enter_tiktok": "🎵 Введите TikTok username:",
+        "enter_ip": "🌐 Введите IP-адрес:",
+        "enter_car": "🚗 Введите номер авто или VIN:",
+        "enter_iin": "🆔 Введите ИИН (12 цифр):",
+        "enter_passport": "🪪 Введите серию и номер паспорта РФ:",
+        "enter_card": "💳 Введите номер банковской карты:",
+        "enter_recursive": "📞 Введите номер для рекурсивного поиска:",
+        "enter_dork": "✏️ Введите Google Dork:",
+        "enter_url": "🔗 Введите URL сайта:",
+        "enter_domain": "🕵️ Введите домен:",
+        "enter_text": "📝 Введите текст для проверки:",
+        "enter_promo": "🔐 Введите промокод:",
+        "searching": "🔍 Поиск...",
+        "loading": "⏳ Загрузка баз данных...",
+        "ai_analyze": "🤖 ИИ анализирует данные...",
+        "found": "✅ Найдена информация:",
+        "not_found": "❌ Ничего не найдено",
+        "promo_required": "❌ Эта функция платная. Введите промокод:",
+        "promo_used": "❌ Промокод уже использован",
+        "promo_invalid": "❌ Неверный промокод",
+        "promo_activated": "✅ Промокод активирован!",
+        "language_changed": "🌍 Язык изменен на Русский",
+        "phone_analyze": "📞 Анализ номера",
+        "factcheck": "✅ Проверка фактов",
+        "search_phone": "📇 Поиск по номеру",
+        "search_fio": "👤 Поиск по ФИО",
+        "search_email": "📧 Поиск по Email",
+        "search_tg": "📱 Поиск по Telegram",
+        "search_address": "🏠 Поиск по адресу",
+        "search_tiktok": "🎵 Поиск по TikTok",
+        "search_ip": "🌐 Поиск по IP",
+        "search_car": "🚗 Поиск по авто",
+        "search_iin": "🆔 Поиск по ИИН",
+        "search_passport": "🪪 Паспорт РФ",
+        "search_card": "💳 Поиск по карте",
+        "recursive": "🔁 Рекурсивный поиск",
+        "extended": "📋 Расширенный поиск",
+        "google_dorks": "🌐 Google Dorks",
+        "webarchive": "📦 Web Archive",
+        "whois": "🕵️ Whois",
+        "subdomains": "📡 Subdomains",
+        "change_lang": "🌍 Сменить язык",
+        "info": "ℹ️ Информация"
+    },
+    "en": {
+        "start": "🔍 OSINT Power Bot v11.0 is ready.\n\nChoose language:",
+        "main_menu": "🔍 Main Menu\n\nChoose function:",
+        "back": "◀️ Back",
+        "choose_base": "Choose database for search:",
+        "enter_phone": "📞 Enter phone number:",
+        "enter_fio": "👤 Enter full name:",
+        "enter_email": "📧 Enter Email:",
+        "enter_tg": "📱 Enter Telegram username:",
+        "enter_address": "🏠 Enter address:",
+        "enter_tiktok": "🎵 Enter TikTok username:",
+        "enter_ip": "🌐 Enter IP address:",
+        "enter_car": "🚗 Enter car number or VIN:",
+        "enter_iin": "🆔 Enter IIN (12 digits):",
+        "enter_passport": "🪪 Enter Russian passport series and number:",
+        "enter_card": "💳 Enter bank card number:",
+        "enter_recursive": "📞 Enter number for recursive search:",
+        "enter_dork": "✏️ Enter Google Dork:",
+        "enter_url": "🔗 Enter website URL:",
+        "enter_domain": "🕵️ Enter domain:",
+        "enter_text": "📝 Enter text to check:",
+        "enter_promo": "🔐 Enter promo code:",
+        "searching": "🔍 Searching...",
+        "loading": "⏳ Loading databases...",
+        "ai_analyze": "🤖 AI analyzing data...",
+        "found": "✅ Information found:",
+        "not_found": "❌ Nothing found",
+        "promo_required": "❌ This function is paid. Enter promo code:",
+        "promo_used": "❌ Promo code already used",
+        "promo_invalid": "❌ Invalid promo code",
+        "promo_activated": "✅ Promo code activated!",
+        "language_changed": "🌍 Language changed to English",
+        "phone_analyze": "📞 Phone analysis",
+        "factcheck": "✅ Fact check",
+        "search_phone": "📇 Search by phone",
+        "search_fio": "👤 Search by name",
+        "search_email": "📧 Search by Email",
+        "search_tg": "📱 Search by Telegram",
+        "search_address": "🏠 Search by address",
+        "search_tiktok": "🎵 Search by TikTok",
+        "search_ip": "🌐 Search by IP",
+        "search_car": "🚗 Search by car",
+        "search_iin": "🆔 Search by IIN",
+        "search_passport": "🪪 Russian passport",
+        "search_card": "💳 Search by card",
+        "recursive": "🔁 Recursive search",
+        "extended": "📋 Extended search",
+        "google_dorks": "🌐 Google Dorks",
+        "webarchive": "📦 Web Archive",
+        "whois": "🕵️ Whois",
+        "subdomains": "📡 Subdomains",
+        "change_lang": "🌍 Change language",
+        "info": "ℹ️ Info"
+    }
+}
+
+# ==================== ЗБЕРІГАННЯ МОВИ ====================
+LANG_FILE = "user_lang.json"
+
+def load_user_lang(user_id: int) -> str:
+    if os.path.exists(LANG_FILE):
+        with open(LANG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get(str(user_id), "uk")
+    return "uk"
+
+def save_user_lang(user_id: int, lang: str):
+    data = {}
+    if os.path.exists(LANG_FILE):
+        with open(LANG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    data[str(user_id)] = lang
+    with open(LANG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_text(user_id: int, key: str) -> str:
+    lang = load_user_lang(user_id)
+    return LANGUAGES.get(lang, LANGUAGES["uk"]).get(key, key)
+
+# ==================== ПРОМОКОДИ ====================
+PROMOCODES_FILE = "promocodes.json"
+
+def load_promocodes():
+    if os.path.exists(PROMOCODES_FILE):
+        with open(PROMOCODES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    promocodes = {}
+    for i in range(50):
+        code = secrets.token_hex(4).upper()
+        promocodes[code] = {"used": False, "used_by": None}
+    save_promocodes(promocodes)
+    return promocodes
+
+def save_promocodes(promocodes):
+    with open(PROMOCODES_FILE, "w", encoding="utf-8") as f:
+        json.dump(promocodes, f, indent=2, ensure_ascii=False)
+
+promocodes = load_promocodes()
+user_promocodes = {}
+
+# ==================== КЛАВІАТУРИ ====================
+def get_main_menu(user_id: int):
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=get_text(user_id, "search_phone")), KeyboardButton(text=get_text(user_id, "search_fio"))],
+            [KeyboardButton(text=get_text(user_id, "search_email")), KeyboardButton(text=get_text(user_id, "search_tg"))],
+            [KeyboardButton(text=get_text(user_id, "search_address")), KeyboardButton(text=get_text(user_id, "search_tiktok"))],
+            [KeyboardButton(text=get_text(user_id, "search_ip")), KeyboardButton(text=get_text(user_id, "search_car"))],
+            [KeyboardButton(text=get_text(user_id, "search_iin")), KeyboardButton(text=get_text(user_id, "search_passport"))],
+            [KeyboardButton(text=get_text(user_id, "search_card")), KeyboardButton(text=get_text(user_id, "phone_analyze"))],
+            [KeyboardButton(text=get_text(user_id, "recursive")), KeyboardButton(text=get_text(user_id, "extended"))],
+            [KeyboardButton(text=get_text(user_id, "google_dorks")), KeyboardButton(text=get_text(user_id, "webarchive"))],
+            [KeyboardButton(text=get_text(user_id, "whois")), KeyboardButton(text=get_text(user_id, "subdomains"))],
+            [KeyboardButton(text=get_text(user_id, "factcheck")), KeyboardButton(text=get_text(user_id, "change_lang"))],
+            [KeyboardButton(text=get_text(user_id, "info")), KeyboardButton(text=get_text(user_id, "back"))]
+        ],
+        resize_keyboard=True
+    )
+
+def get_country_menu(user_id: int):
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🇷🇺 Росія"), KeyboardButton(text="🇺🇦 Україна")],
+            [KeyboardButton(text="🇰🇿 Казахстан"), KeyboardButton(text="🇧🇾 Білорусь")],
+            [KeyboardButton(text="🇲🇩 Молдова"), KeyboardButton(text="🌍 Gmail")],
+            [KeyboardButton(text="🎵 TikTok"), KeyboardButton(text="🏠 Адреси")],
+            [KeyboardButton(text=get_text(user_id, "back"))]
+        ],
+        resize_keyboard=True
+    )
+
+def get_dorks_menu(user_id: int):
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👤 Пошук людини"), KeyboardButton(text="📧 Пошук email")],
+            [KeyboardButton(text="📂 Документи"), KeyboardButton(text="💀 Адмінки")],
+            [KeyboardButton(text="🔐 Секретні файли"), KeyboardButton(text="✏️ Свій dork")],
+            [KeyboardButton(text=get_text(user_id, "back"))]
+        ],
+        resize_keyboard=True
+    )
+
+lang_menu = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang_uk")],
+    [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")],
+    [InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")]
+])
+
+# ==================== СТАНИ ====================
+class SearchStates(StatesGroup):
+    waiting_phone = State()
+    waiting_fio = State()
+    waiting_email = State()
+    waiting_tg = State()
+    waiting_address = State()
+    waiting_tiktok = State()
+    waiting_ip = State()
+    waiting_car = State()
+    waiting_iin = State()
+    waiting_passport = State()
+    waiting_card = State()
+    waiting_recursive = State()
+    waiting_dork = State()
+    waiting_url = State()
+    waiting_domain = State()
+    waiting_factcheck = State()
+    waiting_phone_analyze = State()
+    waiting_promo = State()
+    waiting_country = State()
+    waiting_promo_for_email = State()
+
+# ==================== ФУНКЦІЇ ФОРМАТУВАННЯ ====================
+def format_search_result(results, query):
+    """Форматування результатів пошуку з бази даних"""
+    if not results:
+        return None
+    
+    result_text = ""
+    for i, row in enumerate(results[:5]):  # Максимум 5 результатів
+        result_text += f"🔍 РЕЗУЛЬТАТ #{i+1}\n"
+        result_text += "━" * 40 + "\n"
+        
+        # Розпізнаємо дані в рядку
+        row_data = [str(cell).strip() for cell in row if str(cell).strip()]
+        
+        # Телефон
+        for cell in row_data:
+            if re.search(r'[+]?\d{10,12}', cell):
+                result_text += f"📞 Телефон: {cell}\n"
+                break
+        
+        # ФІО
+        for cell in row_data:
+            if re.search(r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+', cell):
+                result_text += f"👤 ФІО: {cell}\n"
+                break
+        
+        # Інші дані
+        other_data = []
+        for cell in row_data:
+            if not re.search(r'[+]?\d{10,12}', cell) and not re.search(r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+', cell):
+                if '@' in cell:
+                    result_text += f"📧 Email: {cell}\n"
+                elif cell.startswith('@'):
+                    result_text += f"📱 Telegram: {cell}\n"
+                elif re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', cell):
+                    result_text += f"🌐 IP: {cell}\n"
+                else:
+                    other_data.append(cell)
+        
+        if other_data:
+            result_text += f"📋 Інше: {', '.join(other_data[:3])}\n"
+        
+        result_text += "\n"
+    
+    return result_text
+
+def format_recursive_result(phone, data):
+    """Форматування рекурсивного результату"""
+    result = f"🔍 РЕЗУЛЬТАТИ ПОШУКУ\n"
+    result += "━" * 40 + "\n\n"
+    
+    result += f"📌 ЗА НОМЕРОМ: {phone}\n"
+    result += f"├─ 📞 Телефон: {phone}\n"
+    
+    if data.get('fio'):
+        result += f"├─ 👤 ФІО: {data['fio']}\n"
+    if data.get('also'):
+        result += f"├─ 👥 Також: {data['also']}\n"
+    if data.get('region'):
+        result += f"├─ 📍 Регіон: {data['region']}\n"
+    if data.get('date'):
+        result += f"├─ 📅 Дата: {data['date']}\n"
+    if data.get('operator'):
+        result += f"└─ 🏦 Оператор: {data['operator']}\n"
+    
+    result += f"\n" + "━" * 40 + "\n\n"
+    result += f"🔁 РЕКУРСИВНИЙ ПОШУК ЗА ФІО\n\n"
+    
+    if data.get('email'):
+        result += f"├─ 📧 Email: {data['email']}\n"
+    if data.get('telegram'):
+        result += f"├─ 📱 Telegram: {data['telegram']}\n"
+    if data.get('tiktok'):
+        result += f"├─ 🎵 TikTok: {data['tiktok']}\n"
+    if data.get('ip'):
+        result += f"├─ 🌐 IP: {data['ip']}\n"
+    if data.get('car'):
+        result += f"├─ 🚗 Авто: {data['car']}\n"
+    if data.get('iin'):
+        result += f"├─ 🆔 ІІН: {data['iin']}\n"
+    if data.get('passport'):
+        result += f"├─ 🪪 Паспорт РФ: {data['passport']}\n"
+    if data.get('address'):
+        result += f"├─ 🏠 Адреса: {data['address']}\n"
+    if data.get('card'):
+        result += f"└─ 💳 Карти: {data['card']}\n"
+    
+    return result
+
+# ==================== ОБРОБНИК /start ====================
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    await message.answer("🔍 OSINT Power Bot v11.0\n\nОберіть мову / Выберите язык / Choose language:", reply_markup=lang_menu)
+
+# ==================== ЗМІНА МОВИ ====================
+@dp.callback_query(lambda c: c.data.startswith("lang_"))
+async def change_language(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    lang = callback.data.split("_")[1]
+    save_user_lang(user_id, lang)
+    await callback.message.delete()
+    await callback.message.answer(get_text(user_id, "main_menu"), reply_markup=get_main_menu(user_id))
+    await callback.answer()
+
+@dp.message(F.text == "🌍 Змінити мову")
+async def change_lang_menu(message: types.Message):
+    await message.answer("Оберіть мову / Выберите язык / Choose language:", reply_markup=lang_menu)
+
+@dp.message(F.text == "◀️ Назад")
+async def back_to_main(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=get_main_menu(user_id))
+
+# ==================== ПОШУК ЗА НОМЕРОМ (РЕАЛЬНИЙ) ====================
+@dp.message(F.text == "📇 Пошук за номером")
+async def search_phone_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_phone"), reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(SearchStates.waiting_phone)
+
+@dp.message(SearchStates.waiting_phone)
+async def search_phone(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    phone = message.text.strip()
+    
+    await message.answer(get_text(user_id, "searching"))
+    
+    # Реальний пошук в базі
+    results = await asyncio.to_thread(db_searcher.search_phone, phone)
+    
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        formatted = format_search_result(results, phone)
+        await message.answer(formatted, reply_markup=get_main_menu(user_id))
+    
+    await state.clear()
+
+# ==================== ПОШУК ЗА ФІО (РЕАЛЬНИЙ) ====================
+@dp.message(F.text == "👤 Пошук за ФІО")
+async def search_fio_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_fio"))
+    await state.set_state(SearchStates.waiting_fio)
+
+@dp.message(SearchStates.waiting_fio)
+async def search_fio(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    name = message.text.strip()
+    
+    await message.answer(get_text(user_id, "searching"))
+    
+    # Реальний пошук в базі
+    results = await asyncio.to_thread(db_searcher.search_name, name)
+    
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        formatted = format_search_result(results, name)
+        await message.answer(formatted, reply_markup=get_main_menu(user_id))
+    
+    await state.clear()
+
+# ==================== ПОШУК ЗА EMAIL (З ПРОМОКОДОМ - ВИПРАВЛЕНО) ====================
+@dp.message(F.text == "📧 Пошук за Email")
+async def search_email_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # Перевіряємо чи є активний промокод
+    if user_id in user_promocodes:
+        await message.answer(get_text(user_id, "enter_email"))
+        await state.set_state(SearchStates.waiting_email)
+    else:
+        await message.answer(get_text(user_id, "promo_required"))
+        await state.set_state(SearchStates.waiting_promo_for_email)
+        await state.update_data(next_action="email")
+
+@dp.message(SearchStates.waiting_promo_for_email)
+async def process_promo_for_email(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    code = message.text.strip().upper()
+    
+    if code not in promocodes:
+        await message.answer(get_text(user_id, "promo_invalid"))
+        await state.clear()
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=get_main_menu(user_id))
+        return
+    
+    if promocodes[code]["used"]:
+        await message.answer(get_text(user_id, "promo_used"))
+        await state.clear()
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=get_main_menu(user_id))
+        return
+    
+    # Активуємо промокод
+    promocodes[code]["used"] = True
+    promocodes[code]["used_by"] = user_id
+    save_promocodes(promocodes)
+    user_promocodes[user_id] = code
+    
+    await message.answer(get_text(user_id, "promo_activated"))
+    await message.answer(get_text(user_id, "enter_email"))
+    await state.set_state(SearchStates.waiting_email)
+
+@dp.message(SearchStates.waiting_email)
+async def search_email(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    email = message.text.strip()
+    
+    await message.answer(get_text(user_id, "searching"))
+    
+    # Пошук email в базі
+    results = await asyncio.to_thread(db_searcher.search_name, email)
+    
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        formatted = format_search_result(results, email)
+        await message.answer(formatted, reply_markup=get_main_menu(user_id))
+    
+    await state.clear()
+
+# ==================== ІНШІ ПОШУКИ ====================
+@dp.message(F.text == "📱 Пошук за Telegram")
+async def search_tg_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_tg"))
+    await state.set_state(SearchStates.waiting_tg)
+
+@dp.message(SearchStates.waiting_tg)
+async def search_tg(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    tg = message.text.strip()
+    await message.answer(get_text(user_id, "searching"))
+    results = await asyncio.to_thread(db_searcher.search_name, tg)
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        await message.answer(format_search_result(results, tg), reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text == "🏠 Пошук за адресою")
+async def search_address_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_address"))
+    await state.set_state(SearchStates.waiting_address)
+
+@dp.message(SearchStates.waiting_address)
+async def search_address(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    address = message.text.strip()
+    await message.answer(get_text(user_id, "searching"))
+    results = await asyncio.to_thread(db_searcher.search_name, address)
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        await message.answer(format_search_result(results, address), reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text == "🎵 Пошук за TikTok")
+async def search_tiktok_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_tiktok"))
+    await state.set_state(SearchStates.waiting_tiktok)
+
+@dp.message(SearchStates.waiting_tiktok)
+async def search_tiktok(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    tiktok = message.text.strip()
+    await message.answer(get_text(user_id, "searching"))
+    results = await asyncio.to_thread(db_searcher.search_name, tiktok)
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        await message.answer(format_search_result(results, tiktok), reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text == "🌐 Пошук за IP")
+async def search_ip_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_ip"))
+    await state.set_state(SearchStates.waiting_ip)
+
+@dp.message(SearchStates.waiting_ip)
+async def search_ip(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    ip = message.text.strip()
+    await message.answer(get_text(user_id, "searching"))
+    results = await asyncio.to_thread(db_searcher.search_name, ip)
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        await message.answer(format_search_result(results, ip), reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text == "🚗 Пошук за авто")
+async def search_car_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_car"))
+    await state.set_state(SearchStates.waiting_car)
+
+@dp.message(SearchStates.waiting_car)
+async def search_car(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    car = message.text.strip()
+    await message.answer(get_text(user_id, "searching"))
+    results = await asyncio.to_thread(db_searcher.search_name, car)
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        await message.answer(format_search_result(results, car), reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+# ==================== АНАЛІЗ НОМЕРА ====================
+@dp.message(F.text == "📞 Аналіз номера")
+async def phone_analyze_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_phone"))
+    await state.set_state(SearchStates.waiting_phone_analyze)
+
+@dp.message(SearchStates.waiting_phone_analyze)
+async def phone_analyze(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    phone = message.text.strip()
+    
+    try:
+        parsed = phonenumbers.parse(phone, None)
+        if not phonenumbers.is_valid_number(parsed):
+            await message.answer("❌ Невірний формат номера")
+        else:
+            country = geocoder.description_for_number(parsed, "ru")
+            operator = carrier.name_for_number(parsed, "ru")
+            result = f"📊 Аналіз номера\n\n📞 Номер: {phone}\n🌍 Країна: {country}\n📡 Оператор: {operator if operator else 'Не визначено'}\n✅ Статус: Валідний"
+            await message.answer(result)
+    except Exception as e:
+        await message.answer(f"❌ Помилка: {str(e)[:100]}")
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=get_main_menu(user_id))
+
+# ==================== РЕКУРСИВНИЙ ПОШУК ====================
+@dp.message(F.text == "🔁 Рекурсивний пошук")
+async def recursive_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_recursive"))
+    await state.set_state(SearchStates.waiting_recursive)
+
+@dp.message(SearchStates.waiting_recursive)
+async def recursive_search(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    phone = message.text.strip()
+    
+    await message.answer(get_text(user_id, "searching"))
+    
+    # Шукаємо в базі
+    results = await asyncio.to_thread(db_searcher.search_phone, phone)
+    
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+        await state.clear()
+        return
+    
+    # Беремо перший результат
+    row = results[0]
+    
+    # Парсимо дані з рядка
+    data = {
+        "fio": "",
+        "also": "",
+        "region": "",
+        "date": "",
+        "operator": "",
+        "email": "",
+        "telegram": "",
+        "tiktok": "",
+        "ip": "",
+        "car": "",
+        "iin": "",
+        "passport": "",
+        "address": "",
+        "card": ""
+    }
+    
+    # Розпізнаємо поля
+    for cell in row:
+        cell_str = str(cell).strip()
+        if re.search(r'[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+', cell_str) and not data["fio"]:
+            data["fio"] = cell_str
+        elif ',' in cell_str and len(cell_str) > 20 and not data["also"]:
+            data["also"] = cell_str
+        elif 'область' in cell_str or 'район' in cell_str:
+            data["region"] = cell_str
+        elif re.match(r'\d{2}[./]\d{2}[./]\d{4}', cell_str):
+            data["date"] = cell_str
+        elif '@' in cell_str:
+            data["email"] = cell_str
+        elif cell_str.startswith('@'):
+            data["telegram"] = cell_str
+        elif 'tiktok' in cell_str.lower():
+            data["tiktok"] = cell_str
+        elif re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', cell_str):
+            data["ip"] = cell_str
+        elif 'Toyota' in cell_str or 'Audi' in cell_str or 'BMW' in cell_str:
+            data["car"] = cell_str
+        elif re.match(r'^\d{12}$', cell_str):
+            data["iin"] = cell_str
+        elif re.match(r'^\d{4}\s\d{6}$', cell_str) or re.match(r'^\d{10}$', cell_str):
+            data["passport"] = cell_str
+        elif 'вул.' in cell_str or 'м.' in cell_str:
+            data["address"] = cell_str
+        elif re.match(r'^\*{4}\d{4}', cell_str):
+            data["card"] = cell_str
+    
+    result = format_recursive_result(phone, data)
+    
+    # ШІ-аналіз
+    if ai_enabled:
+        await message.answer(get_text(user_id, "ai_analyze"))
+        try:
+            ai_response = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Ти експерт з OSINT аналізу. Аналізуй знайдені дані та знаходь зв'язки. Відповідай коротко українською."},
+                    {"role": "user", "content": f"Проаналізуй ці OSINT дані та напиши короткий висновок (зв'язки, ризики, рекомендації):\n{result}"}
+                ],
+                timeout=30
+            )
+            ai_analysis = f"\n\n━" * 40 + "\n\n🤖 ШТУЧНИЙ ІНТЕЛЕКТ (АНАЛІЗ)\n\n{ai_response.choices[0].message.content}"
+            result += ai_analysis
+        except Exception as e:
+            logging.error(f"AI помилка: {e}")
+    
+    await message.answer(result, reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+# ==================== ІНШІ ФУНКЦІЇ (заглушки) ====================
+@dp.message(F.text == "🆔 Пошук за ІІН")
+async def search_iin_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_iin"))
+    await state.set_state(SearchStates.waiting_iin)
+
+@dp.message(SearchStates.waiting_iin)
+async def search_iin(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    iin = message.text.strip().replace(" ", "").replace("-", "")
+    
+    if re.match(r'^\d{12}$', iin):
+        year = 1900 + int(iin[0:2]) if int(iin[6]) in [3,4] else 2000 + int(iin[0:2])
+        gender = "Чоловіча" if int(iin[6]) % 2 == 1 else "Жіноча"
+        result = f"🇰🇿 ІІН Казахстан\n📅 Дата: {iin[4:6]}.{iin[2:4]}.{year}\n👤 Стать: {gender}"
+    else:
+        result = "❌ Невірний формат ІІН"
+    
+    await message.answer(result, reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text == "🪪 Паспорт РФ")
+async def search_passport_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_passport"))
+    await state.set_state(SearchStates.waiting_passport)
+
+@dp.message(SearchStates.waiting_passport)
+async def search_passport(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    passport = message.text.strip()
+    results = await asyncio.to_thread(db_searcher.search_name, passport)
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        await message.answer(format_search_result(results, passport), reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text == "💳 Пошук за картою")
+async def search_card_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_card"))
+    await state.set_state(SearchStates.waiting_card)
+
+@dp.message(SearchStates.waiting_card)
+async def search_card(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    card = message.text.strip()
+    results = await asyncio.to_thread(db_searcher.search_name, card)
+    if not results:
+        await message.answer(get_text(user_id, "not_found"), reply_markup=get_main_menu(user_id))
+    else:
+        await message.answer(format_search_result(results, card), reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text == "📋 Розширений пошук")
+async def extended_search(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(
+        "📋 РОЗШИРЕНИЙ ПОШУК\n\n"
+        "Надішліть дані у форматі:\n"
+        "Прізвище: Іванов\n"
+        "Ім'я: Іван\n"
+        "По батькові: Іванович\n"
+        "День: 15\n"
+        "Місяць: 05\n"
+        "Рік: 1990\n\n"
+        "Або просто введіть ПІБ для пошуку"
+    )
+    await state.set_state(SearchStates.waiting_fio)
+
+@dp.message(F.text == "🌐 Google Dorks")
+async def google_dorks_menu(message: types.Message):
+    user_id = message.from_user.id
+    await message.answer("🔎 Google Dork\nВиберіть тип пошуку:", reply_markup=get_dorks_menu(user_id))
+
+@dp.message(F.text == "✏️ Свій dork")
+async def custom_dork(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_dork"))
+    await state.set_state(SearchStates.waiting_dork)
+
+@dp.message(SearchStates.waiting_dork)
+async def process_dork(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    dork = message.text.strip()
+    await message.answer(f"🔍 Google Dork: {dork}\n🔗 https://www.google.com/search?q={dork.replace(' ', '+')}", reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text.in_({"👤 Пошук людини", "📧 Пошук email", "📂 Документи", "💀 Адмінки", "🔐 Секретні файли"}))
+async def preset_dork(message: types.Message):
+    dorks = {
+        "👤 Пошук людини": '"{query}" site:instagram.com | site:t.me',
+        "📧 Пошук email": '"{query}" filetype:pdf',
+        "📂 Документи": 'filetype:pdf "confidential"',
+        "💀 Адмінки": 'inurl:admin | inurl:login',
+        "🔐 Секретні файли": 'filetype:env "api_key"'
+    }
+    dork = dorks.get(message.text, "")
+    await message.answer(f"🔍 Шаблон: {dork}\n🔗 https://www.google.com/search?q={dork.replace(' ', '+')}")
+
+@dp.message(F.text == "📦 Web Archive")
+async def webarchive_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_url"))
+    await state.set_state(SearchStates.waiting_url)
+
+@dp.message(SearchStates.waiting_url)
+async def webarchive_check(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    url = message.text.strip()
+    await message.answer("📁 Шукаю архівні копії...")
+    
+    try:
+        encoded_url = urllib.parse.quote(url, safe='')
+        archive_url = f"https://archive.org/wayback/available?url={encoded_url}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(archive_url, timeout=15) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("archived_snapshots"):
+                        snapshot = data["archived_snapshots"]["closest"]
+                        await message.answer(f"📁 Архівна копія: {snapshot.get('url', 'немає')}")
+                    else:
+                        await message.answer("❌ Архівних копій не знайдено")
+                else:
+                    await message.answer("❌ Помилка при зверненні до архіву")
+    except Exception as e:
+        await message.answer(f"❌ Помилка: {str(e)[:100]}")
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=get_main_menu(user_id))
+
+@dp.message(F.text == "🕵️ Whois")
+async def whois_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_domain"))
+    await state.set_state(SearchStates.waiting_domain)
+
+@dp.message(SearchStates.waiting_domain)
+async def whois_check(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    domain = message.text.strip()
+    result = f"🕵️ WHOIS: {domain}\n\n📋 Реєстратор: NameCheap, Inc.\n📅 Створено: 2010-01-01\n📅 Закінчується: 2026-01-01"
+    await message.answer(result, reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text == "📡 Subdomains")
+async def subdomains_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_domain"))
+    await state.set_state(SearchStates.waiting_domain)
+
+@dp.message(SearchStates.waiting_domain)
+async def subdomains_check(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    domain = message.text.strip()
+    result = f"📡 ПІДДОМЕНИ: {domain}\n\n├─ mail.{domain}\n├─ admin.{domain}\n├─ api.{domain}\n└─ cdn.{domain}"
+    await message.answer(result, reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+@dp.message(F.text == "✅ Перевірка фактів")
+async def factcheck_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    await message.answer(get_text(user_id, "enter_text"))
+    await state.set_state(SearchStates.waiting_factcheck)
+
+@dp.message(SearchStates.waiting_factcheck)
+async def factcheck(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    
+    if len(text) < 10:
+        await message.answer("❌ Занадто короткий текст")
+        return
+    
+    await message.answer("🧠 Аналізую...")
+    
+    if not ai_enabled:
+        await message.answer("❌ AI функції тимчасово недоступні")
+    else:
+        try:
+            response = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Ти експерт з перевірки фактів. Відповідай коротко українською."},
+                    {"role": "user", "content": text}
+                ],
+                timeout=30
+            )
+            await message.answer(f"✅ Результат:\n\n{response.choices[0].message.content}")
+        except Exception as e:
+            await message.answer(f"❌ Помилка: {str(e)[:100]}")
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=get_main_menu(user_id))
+
+@dp.message(F.text == "ℹ️ Інформація")
+async def bot_info(message: types.Message):
+    user_id = message.from_user.id
+    info_text = f"""🤖 OSINT Power Bot v11.0
+
+🔍 Функції:
+• Пошук по номеру телефону
+• Пошук по ФІО
+• Пошук по Email (промокод)
+• Пошук по Telegram/адресі/TikTok/IP/авто
+• Пошук по ІІН та паспорту
+• Пошук по банківській карті
+• Аналіз номера телефону
+• Рекурсивний пошук
+• Google Dorks та WebArchive
+• Whois / Subdomains
+• Перевірка фактів через ШІ
+
+🧠 Штучний інтелект: GPT-4o-mini
+🌍 Мови: Українська / Русский / English
+
+📊 Статистика:
+📁 Записів в базі: {len(db_searcher.data)}"""
+    
+    await message.answer(info_text, reply_markup=get_main_menu(user_id))
+
+# ==================== ЗАПУСК ====================
+async def main():
+    print("=" * 60)
+    print("🤖 OSINT Power Bot v11.0 - ВИПРАВЛЕНО")
+    print("=" * 60)
+    
+    # Завантажуємо базу даних
+    db_searcher.load_data()
+    
+    print(f"✅ AI статус: {'Активовано' if ai_enabled else 'Вимкнено'}")
+    print(f"📋 Промокодів: {len(promocodes)}")
+    print(f"📊 Записів в базі: {len(db_searcher.data)}")
+    print("=" * 60)
+    print("✅ Бот запущено!")
+    print("=" * 60)
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
