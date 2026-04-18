@@ -1,0 +1,1351 @@
+import asyncio
+import logging
+import os
+import re
+import json
+import secrets
+import csv
+import sqlite3
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+import phonenumbers
+from phonenumbers import carrier, geocoder
+import aiohttp
+import urllib.parse
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OWNER_ID = int(os.getenv("OWNER_ID", "8640510286"))
+
+if not BOT_TOKEN:
+    print("❌ Немає BOT_TOKEN")
+    exit(1)
+
+if OPENAI_API_KEY:
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    ai_enabled = True
+    print("✅ AI функції активовано")
+else:
+    ai_enabled = False
+    print("⚠️ OpenAI API ключ не знайдено")
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+csv.field_size_limit(50_000_000)
+
+# =============== БАЗА ДАНИХ КОРИСТУВАЧІВ ===============
+USERS_DB = "users.db"
+
+def init_db():
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        language TEXT DEFAULT 'uk',
+        promo_code TEXT,
+        promo_expiry TEXT,
+        search_count INTEGER DEFAULT 0
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS search_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, query TEXT, query_type TEXT, 
+        country TEXT, result_count INTEGER, search_date TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_user(user_id):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT language, promo_code, promo_expiry, search_count FROM users WHERE user_id = ?", (user_id,))
+    r = cursor.fetchone()
+    conn.close()
+    if r:
+        return {"language": r[0], "promo_code": r[1], "promo_expiry": r[2], "search_count": r[3]}
+    return None
+
+def save_user(user_id, lang="uk"):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, language, search_count) VALUES (?, ?, 0)", (user_id, lang))
+    cursor.execute("UPDATE users SET language = ? WHERE user_id = ?", (lang, user_id))
+    conn.commit()
+    conn.close()
+
+def update_promo(user_id, code):
+    expiry = (datetime.now() + timedelta(days=30)).isoformat()
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET promo_code = ?, promo_expiry = ? WHERE user_id = ?", (code, expiry, user_id))
+    conn.commit()
+    conn.close()
+
+def check_promo(user_id):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT promo_expiry FROM users WHERE user_id = ?", (user_id,))
+    r = cursor.fetchone()
+    conn.close()
+    if r and r[0]:
+        return datetime.fromisoformat(r[0]) > datetime.now()
+    return False
+
+def add_history(user_id, query, qtype, country, count):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO search_history (user_id, query, query_type, country, result_count, search_date) VALUES (?,?,?,?,?,?)",
+                   (user_id, query, qtype, country, count, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def inc_search(user_id):
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET search_count = search_count + 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+# =============== НАЛАШТУВАННЯ ===============
+DATABASES_DIR = "database"
+
+# Автоматичне визначення всіх баз (папок в database/)
+def get_available_databases():
+    """Автоматично сканує всі папки в database/ і створює кнопки"""
+    databases = {}
+    if os.path.exists(DATABASES_DIR):
+        for item in os.listdir(DATABASES_DIR):
+            item_path = os.path.join(DATABASES_DIR, item)
+            if os.path.isdir(item_path) and not item.startswith('.'):
+                # Перетворюємо назву папки в гарну назву для кнопки
+                name_map = {
+                    "rf": "🇷🇺 РОССИЯ", "ua": "🇺🇦 УКРАЇНА", "kz": "🇰🇿 КАЗАХСТАН",
+                    "by": "🇧🇾 БЕЛАРУСЬ", "md": "🇲🇩 МОЛДОВА", "gmail": "📧 GMAIL",
+                    "tiktok": "🎵 TIKTOK", "tg": "📱 TELEGRAM", "vk": "🎥 VK",
+                    "yandex_eda": "🍔 ЯНДЕКС ЕДА", "mts_bank": "🏦 МТС БАНК",
+                    "mvd": "🏛 МВД", "ip": "🌐 IP", "auto": "🚗 АВТО", "addresses": "🏠 АДРЕСИ"
+                }
+                display_name = name_map.get(item, f"📁 {item.upper()}")
+                databases[item] = display_name
+    return databases
+
+# Отримуємо всі доступні бази
+COUNTRIES = get_available_databases()
+
+# Якщо баз немає, створюємо стандартні
+if not COUNTRIES:
+    COUNTRIES = {
+        "rf": "🇷🇺 РОССИЯ", "ua": "🇺🇦 УКРАЇНА", "kz": "🇰🇿 КАЗАХСТАН",
+        "by": "🇧🇾 БЕЛАРУСЬ", "md": "🇲🇩 МОЛДОВА", "gmail": "📧 GMAIL",
+        "tiktok": "🎵 TIKTOK", "tg": "📱 TELEGRAM", "vk": "🎥 VK",
+        "yandex_eda": "🍔 ЯНДЕКС ЕДА", "mts_bank": "🏦 МТС БАНК",
+        "mvd": "🏛 МВД", "ip": "🌐 IP", "auto": "🚗 АВТО", "addresses": "🏠 АДРЕСИ"
+    }
+
+# Створюємо папки для кожної бази
+for folder in COUNTRIES.keys():
+    os.makedirs(os.path.join(DATABASES_DIR, folder), exist_ok=True)
+
+# =============== МОВИ ===============
+LANGUAGES = {
+    "uk": {
+        "start": "🤖 OSINT Power Bot v12.0\n\n🔍 **МОЖЛИВОСТІ:**\n• 📞 Пошук за номером телефону\n• 👤 Пошук за ФІО\n• 📧 Пошук за Email\n• 📱 Пошук за Telegram\n• 🎥 Пошук за VK\n• 🍔 Пошук за Яндекс Еда\n• 🏦 Пошук за МТС Банк\n• 🏛 Пошук за МВД\n• 🆔 Аналіз ІІН\n• 🔄 Глибокий рекурсивний пошук\n• 📊 Аналіз номера\n• 🔎 Google Dork\n• 📁 WebArchive\n• ✅ Перевірка фактів через ШІ\n\nОберіть базу для пошуку:",
+        "main_menu": "🔍 Головне меню\n\nОберіть базу:",
+        "search_phone": "📞 Пошук за номером",
+        "search_fio": "👤 Пошук за ФІО",
+        "search_email": "📧 Пошук за Email",
+        "search_tg": "📱 Пошук за Telegram",
+        "search_vk": "🎥 Пошук за VK",
+        "search_yandex": "🍔 Пошук за Яндекс Еда",
+        "search_mts": "🏦 Пошук за МТС Банк",
+        "search_mvd": "🏛 Пошук за МВД",
+        "search_iin": "🆔 Аналіз ІІН",
+        "deep_search": "🔄 ГЛИБОКИЙ ПОШУК",
+        "phone_analyze": "📊 Аналіз номера",
+        "google_dork": "🔎 Google Dork",
+        "webarchive": "📁 WebArchive",
+        "factcheck": "✅ Перевірка фактів",
+        "activate_promo": "🔐 Активація промокоду",
+        "change_lang": "🌍 Змінити мову",
+        "info": "ℹ️ Інфо",
+        "history": "📜 Історія",
+        "enter_phone": "📞 Введіть номер телефону (наприклад: +79092809644):",
+        "enter_fio": "👤 Введіть ПІБ (наприклад: Афанасьева Ольга):",
+        "enter_email": "📧 Введіть Email для пошуку:",
+        "enter_tg": "📱 Введіть Telegram username (наприклад: @username):",
+        "enter_vk": "🎥 Введіть VK id або username:",
+        "enter_yandex": "🍔 Введіть номер телефону для пошуку в Яндекс Еда:",
+        "enter_mts": "🏦 Введіть номер телефону для пошуку в МТС Банк:",
+        "enter_mvd": "🏛 Введіть номер паспорта або ПІБ для перевірки в МВД:",
+        "enter_iin": "🆔 Введіть ІІН (12 цифр) для аналізу:",
+        "enter_text": "📝 Введіть текст для перевірки:",
+        "enter_url": "🔗 Введіть URL сайту:",
+        "enter_promo": "🔐 Введіть промокод:",
+        "enter_dork": "🔎 Введіть Google Dork запит:",
+        "not_found": "❌ Нічого не знайдено",
+        "found": "✅ Знайдено {count} записів",
+        "promo_required": "❌ Ця функція платна. Введіть промокод:",
+        "promo_activated": "✅ Промокод активовано на 30 днів!",
+        "promo_invalid": "❌ Невірний промокод",
+        "lang_changed": "🌍 Мову змінено",
+        "back": "◀️ Назад",
+        "continue_search": "🔍 ПРОДОВЖИТИ ПОШУК?",
+        "continue_yes": "✅ Так",
+        "continue_no": "❌ Ні",
+        "searching": "🔍 Шукаю {query} в {country}...",
+        "ai_analyze": "🤖 ШІ аналізує дані...",
+        "recursive_searching": "🔄 ПРОДОВЖУЮ ПОШУК НОВИХ ЗБІГІВ...\n\n🔍 Шукаю за знайденими телефонами: {phones}\n🔍 Шукаю за знайденими іменами: {names}\n🔍 Шукаю за знайденими email: {emails}",
+        "new_data_found": "🔄 **НОВІ ЗНАЙДЕНІ ДАНІ:**\n\n",
+        "no_new_data": "❌ Нових даних не знайдено",
+        "iin_analysis": "🆔 **АНАЛІЗ ІІН**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 ІІН: {iin}\n\n📅 Дата народження: {birth_date}\n👤 Стать: {gender}\n📍 Регіон: {region}\n\n📊 **ДОДАТКОВІ ДАНІ:**\n{extra}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n✅ Джерело: База Казахстан (ІІН)"
+    },
+    "ru": {
+        "start": "🤖 OSINT Power Bot v12.0\n\n🔍 **ВОЗМОЖНОСТИ:**\n• 📞 Поиск по номеру телефона\n• 👤 Поиск по ФИО\n• 📧 Поиск по Email\n• 📱 Поиск по Telegram\n• 🎥 Поиск по VK\n• 🍔 Поиск по Яндекс Еда\n• 🏦 Поиск по МТС Банк\n• 🏛 Поиск по МВД\n• 🆔 Анализ ИИН\n• 🔄 Глубокий рекурсивный поиск\n• 📊 Анализ номера\n• 🔎 Google Dork\n• 📁 WebArchive\n• ✅ Проверка фактов через ИИ\n\nВыберите базу для поиска:",
+        "main_menu": "🔍 Главное меню\n\nВыберите базу:",
+        "search_phone": "📞 Поиск по номеру",
+        "search_fio": "👤 Поиск по ФИО",
+        "search_email": "📧 Поиск по Email",
+        "search_tg": "📱 Поиск по Telegram",
+        "search_vk": "🎥 Поиск по VK",
+        "search_yandex": "🍔 Поиск по Яндекс Еда",
+        "search_mts": "🏦 Поиск по МТС Банк",
+        "search_mvd": "🏛 Поиск по МВД",
+        "search_iin": "🆔 Анализ ИИН",
+        "deep_search": "🔄 ГЛУБОКИЙ ПОИСК",
+        "phone_analyze": "📊 Анализ номера",
+        "google_dork": "🔎 Google Dork",
+        "webarchive": "📁 WebArchive",
+        "factcheck": "✅ Проверка фактов",
+        "activate_promo": "🔐 Активация промокода",
+        "change_lang": "🌍 Сменить язык",
+        "info": "ℹ️ Инфо",
+        "history": "📜 История",
+        "enter_phone": "📞 Введите номер телефона (например: +79092809644):",
+        "enter_fio": "👤 Введите ФИО (например: Афанасьева Ольга):",
+        "enter_email": "📧 Введите Email для поиска:",
+        "enter_tg": "📱 Введите Telegram username (например: @username):",
+        "enter_vk": "🎥 Введите VK id или username:",
+        "enter_yandex": "🍔 Введите номер телефона для поиска в Яндекс Еда:",
+        "enter_mts": "🏦 Введите номер телефона для поиска в МТС Банк:",
+        "enter_mvd": "🏛 Введите номер паспорта или ФИО для проверки в МВД:",
+        "enter_iin": "🆔 Введите ИИН (12 цифр) для анализа:",
+        "enter_text": "📝 Введите текст для проверки:",
+        "enter_url": "🔗 Введите URL сайта:",
+        "enter_promo": "🔐 Введите промокод:",
+        "enter_dork": "🔎 Введите Google Dork запрос:",
+        "not_found": "❌ Ничего не найдено",
+        "found": "✅ Найдено {count} записей",
+        "promo_required": "❌ Эта функция платная. Введите промокод:",
+        "promo_activated": "✅ Промокод активирован на 30 дней!",
+        "promo_invalid": "❌ Неверный промокод",
+        "lang_changed": "🌍 Язык изменен",
+        "back": "◀️ Назад",
+        "continue_search": "🔍 ПРОДОЛЖИТЬ ПОИСК?",
+        "continue_yes": "✅ Да",
+        "continue_no": "❌ Нет",
+        "searching": "🔍 Ищу {query} в {country}...",
+        "ai_analyze": "🤖 ИИ анализирует данные...",
+        "recursive_searching": "🔄 ПРОДОЛЖАЮ ПОИСК НОВЫХ СОВПАДЕНИЙ...\n\n🔍 Ищу по найденным телефонам: {phones}\n🔍 Ищу по найденным именам: {names}\n🔍 Ищу по найденным email: {emails}",
+        "new_data_found": "🔄 **НОВЫЕ НАЙДЕННЫЕ ДАННЫЕ:**\n\n",
+        "no_new_data": "❌ Новых данных не найдено",
+        "iin_analysis": "🆔 **АНАЛИЗ ИИН**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📌 ИИН: {iin}\n\n📅 Дата рождения: {birth_date}\n👤 Пол: {gender}\n📍 Регион: {region}\n\n📊 **ДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ:**\n{extra}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n✅ Источник: База Казахстан (ИИН)"
+    }
+}
+
+def get_text(user_id, key, **kwargs):
+    user = get_user(user_id)
+    lang = user["language"] if user else "uk"
+    text = LANGUAGES.get(lang, LANGUAGES["uk"]).get(key, key)
+    if kwargs:
+        return text.format(**kwargs)
+    return text
+
+# =============== ПРОМОКОДИ ===============
+PROMOCODES_FILE = "promocodes.json"
+
+def load_promocodes():
+    if os.path.exists(PROMOCODES_FILE):
+        with open(PROMOCODES_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    codes = {}
+    for _ in range(50):
+        code = secrets.token_hex(4).upper()
+        codes[code] = {"used": False}
+    save_promocodes(codes)
+    return codes
+
+def save_promocodes(codes):
+    with open(PROMOCODES_FILE, 'w', encoding='utf-8') as f:
+        json.dump(codes, f, indent=2, ensure_ascii=False)
+
+promocodes = load_promocodes()
+
+# =============== КЛАС ДЛЯ ПОШУКУ ===============
+class DatabaseSearcher:
+    def __init__(self):
+        self.file_cache = {}
+    
+    def get_files_for_country(self, country_code):
+        folder = os.path.join(DATABASES_DIR, country_code)
+        if not os.path.exists(folder):
+            return []
+        files = []
+        for item in os.listdir(folder):
+            item_path = os.path.join(folder, item)
+            if os.path.isfile(item_path):
+                if item in ['.DS_Store', 'Thumbs.db', 'desktop.ini']:
+                    continue
+                files.append(item_path)
+        return files
+    
+    def search_in_file(self, file_path, query, search_type="phone"):
+        results = []
+        try:
+            cache_key = f"{file_path}:{query}:{search_type}"
+            if cache_key in self.file_cache:
+                return self.file_cache[cache_key]
+            
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+                
+                query_clean = re.sub(r'\D', '', query) if search_type == "phone" else query.lower()
+                if search_type == "tg" and query.startswith('@'):
+                    query_clean = query[1:].lower()
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    if '|' in line:
+                        cells = line.split('|')
+                    elif ',' in line:
+                        cells = line.split(',')
+                    elif ';' in line:
+                        cells = line.split(';')
+                    elif '\t' in line:
+                        cells = line.split('\t')
+                    else:
+                        cells = [line]
+                    
+                    if search_type == "phone":
+                        for cell in cells:
+                            cell_clean = re.sub(r'\D', '', str(cell))
+                            if cell_clean and (cell_clean == query_clean or (len(cell_clean) >= 7 and cell_clean.endswith(query_clean[-7:]))):
+                                results.append(cells)
+                                break
+                    elif search_type == "iin":
+                        for cell in cells:
+                            cell_clean = re.sub(r'\D', '', str(cell))
+                            if len(cell_clean) == 12 and cell_clean == query_clean:
+                                results.append(cells)
+                                break
+                    else:
+                        line_lower = line.lower()
+                        if query_clean in line_lower:
+                            results.append(cells)
+                    
+                    if len(results) >= 50:
+                        break
+            
+            self.file_cache[cache_key] = results
+            return results
+        except Exception as e:
+            print(f"❌ Помилка {file_path}: {str(e)[:100]}")
+            return []
+    
+    def search_country(self, country_code, query, search_type="phone"):
+        files = self.get_files_for_country(country_code)
+        all_results = []
+        
+        for file_path in files:
+            results = self.search_in_file(file_path, query, search_type)
+            if results:
+                all_results.extend(results)
+            if len(all_results) >= 50:
+                break
+        
+        unique = []
+        for r in all_results:
+            if r not in unique:
+                unique.append(r)
+        
+        return unique[:50]
+    
+    def recursive_continue_search(self, country_code, existing_data, max_new=30):
+        """Рекурсивний пошук нових даних на основі вже знайдених"""
+        all_results = []
+        processed_queries = set()
+        
+        # Додаємо всі знайдені телефони в чергу для пошуку
+        queries = []
+        for phone in existing_data.get("phones", [])[:5]:
+            if phone not in processed_queries:
+                queries.append(("phone", phone))
+                processed_queries.add(phone)
+        
+        for name in existing_data.get("names", [])[:5]:
+            if name not in processed_queries:
+                queries.append(("name", name))
+                processed_queries.add(name)
+        
+        for email in existing_data.get("emails", [])[:3]:
+            if email not in processed_queries:
+                queries.append(("email", email))
+                processed_queries.add(email)
+        
+        # Шукаємо нові дані
+        for qtype, qvalue in queries:
+            if qtype == "phone":
+                results = self.search_country(country_code, qvalue, "phone")
+            elif qtype == "email":
+                results = self.search_country(country_code, qvalue, "email")
+            else:
+                results = self.search_country(country_code, qvalue, "name")
+            
+            for row in results:
+                if row not in all_results:
+                    all_results.append(row)
+                if len(all_results) >= max_new:
+                    break
+            if len(all_results) >= max_new:
+                break
+        
+        return self.format_results(all_results, "phone")
+    
+    def analyze_iin(self, iin):
+        if not re.match(r'^\d{12}$', iin):
+            return None
+        
+        century = int(iin[6])
+        if century in [3, 4]:
+            year = 1900 + int(iin[0:2])
+        else:
+            year = 2000 + int(iin[0:2])
+        
+        month = int(iin[2:4])
+        day = int(iin[4:6])
+        gender = "Чоловіча" if century % 2 == 1 else "Жіноча"
+        
+        region_codes = {
+            "1": "м. Астана", "2": "м. Алмати", "3": "Акмолинская", "4": "Актюбинская",
+            "5": "Алматинская", "6": "Атырауская", "7": "Западно-Казахстанская"
+        }
+        region = region_codes.get(iin[:2], "Казахстан")
+        
+        extra_data = []
+        results = self.search_country("kz", iin, "iin")
+        for row in results[:3]:
+            for cell in row:
+                cell_str = str(cell).strip()
+                if re.match(r'[+]?\d{10,12}', cell_str):
+                    extra_data.append(f"📞 Телефон: {cell_str}")
+                elif '@' in cell_str:
+                    extra_data.append(f"📧 Email: {cell_str}")
+                elif cell_str.startswith('@'):
+                    extra_data.append(f"📱 Telegram: {cell_str}")
+        
+        return {
+            "iin": iin,
+            "birth_date": f"{day:02d}.{month:02d}.{year}",
+            "gender": gender,
+            "region": region,
+            "extra": "\n".join(extra_data) if extra_data else "Немає додаткових даних"
+        }
+    
+    def format_results(self, results, search_type="phone"):
+        if not results:
+            return None
+        
+        phones, names, emails, tg, vk, addresses, dates = set(), set(), set(), set(), set(), set(), set()
+        orders, cards = [], []
+        
+        for row in results:
+            for cell in row:
+                cell_str = str(cell).strip()
+                
+                phone_clean = re.sub(r'\D', '', cell_str)
+                if len(phone_clean) >= 10 and len(phone_clean) <= 12:
+                    phones.add(phone_clean)
+                
+                if re.search(r'[А-ЯЁІЇЄ][а-яёіїє]+\s+[А-ЯЁІЇЄ][а-яёіїє]+', cell_str):
+                    names.add(cell_str)
+                
+                if '@' in cell_str and '.' in cell_str:
+                    emails.add(cell_str.lower())
+                
+                if cell_str.startswith('@'):
+                    tg.add(cell_str)
+                
+                if 'vk.com' in cell_str.lower() or cell_str.startswith('id'):
+                    vk.add(cell_str)
+                
+                if any(w in cell_str.lower() for w in ['вул', 'ул', 'просп', 'місто', 'город']):
+                    addresses.add(cell_str)
+                
+                if re.match(r'\d{2}[./]\d{2}[./]\d{4}', cell_str):
+                    dates.add(cell_str)
+                
+                if search_type == "yandex_eda" and '|' in str(row) and len(row) >= 6:
+                    orders.append({"phone": row[0], "name": row[1], "address": row[2], "date": row[3], "amount": row[4], "items": row[5]})
+                
+                if search_type == "mts_bank" and '|' in str(row) and len(row) >= 5:
+                    cards.append({"phone": row[0], "name": row[1], "card": row[2], "expiry": row[3], "balance": row[4]})
+        
+        return {
+            "phones": list(phones)[:10],
+            "names": list(names)[:10],
+            "emails": list(emails)[:5],
+            "tg": list(tg)[:5],
+            "vk": list(vk)[:5],
+            "addresses": list(addresses)[:5],
+            "dates": list(dates)[:10],
+            "orders": orders[:10],
+            "cards": cards[:10]
+        }
+
+searcher = DatabaseSearcher()
+
+# =============== КЛАВІАТУРИ ===============
+def country_keyboard(user_id):
+    buttons = []
+    row = []
+    for code, name in COUNTRIES.items():
+        row.append(InlineKeyboardButton(text=name, callback_data=f"country_{code}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="📊 Аналіз номера", callback_data="tool_analyze")])
+    buttons.append([InlineKeyboardButton(text="🆔 Аналіз ІІН", callback_data="tool_iin")])
+    buttons.append([InlineKeyboardButton(text="🔎 Google Dork", callback_data="tool_dork")])
+    buttons.append([InlineKeyboardButton(text="📁 WebArchive", callback_data="tool_webarchive")])
+    buttons.append([InlineKeyboardButton(text="✅ Перевірка фактів", callback_data="tool_factcheck")])
+    buttons.append([InlineKeyboardButton(text=get_text(user_id, "activate_promo"), callback_data="promo")])
+    buttons.append([InlineKeyboardButton(text=get_text(user_id, "change_lang"), callback_data="lang")])
+    buttons.append([InlineKeyboardButton(text=get_text(user_id, "info"), callback_data="info")])
+    buttons.append([InlineKeyboardButton(text=get_text(user_id, "history"), callback_data="history")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def action_keyboard(user_id, country_code):
+    buttons = [
+        [InlineKeyboardButton(text=get_text(user_id, "search_phone"), callback_data=f"action_phone_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_fio"), callback_data=f"action_fio_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "search_email"), callback_data=f"action_email_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "deep_search"), callback_data=f"action_deep_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "back"), callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def special_action_keyboard(user_id, country_code, action_name, action_callback):
+    buttons = [
+        [InlineKeyboardButton(text=action_name, callback_data=f"{action_callback}_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "deep_search"), callback_data=f"action_deep_{country_code}")],
+        [InlineKeyboardButton(text=get_text(user_id, "back"), callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def continue_keyboard(user_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=get_text(user_id, "continue_yes"), callback_data="continue_yes"),
+         InlineKeyboardButton(text=get_text(user_id, "continue_no"), callback_data="continue_no")]
+    ])
+
+def lang_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang_uk")],
+        [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")]
+    ])
+
+def dork_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Пошук людини", callback_data="dork_person")],
+        [InlineKeyboardButton(text="📧 Пошук email", callback_data="dork_email")],
+        [InlineKeyboardButton(text="📂 Документи", callback_data="dork_docs")],
+        [InlineKeyboardButton(text="💀 Адмінки", callback_data="dork_admin")],
+        [InlineKeyboardButton(text="🔐 Секретні файли", callback_data="dork_secret")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
+    ])
+
+# =============== ФУНКЦІЇ ФОРМАТУВАННЯ ===============
+def format_main_result(data, query, country_name):
+    if not data:
+        return None
+    
+    result = f"🔍 РЕЗУЛЬТАТИ ПОШУКУ\n"
+    result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    result += f"📌 База: {country_name}\n"
+    result += f"📌 Запит: {query}\n\n"
+    result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    if data.get("names"):
+        result += f"👤 ОСНОВНА ОСОБА: {data['names'][0]}\n\n"
+    
+    if data.get("phones"):
+        result += "📞 ТЕЛЕФОНИ:\n"
+        for i, phone in enumerate(data["phones"]):
+            prefix = "├─" if i < len(data["phones"]) - 1 else "└─"
+            result += f"{prefix} {phone}\n"
+        result += "\n"
+    
+    if data.get("emails"):
+        result += "📧 EMAIL:\n"
+        for i, email in enumerate(data["emails"]):
+            prefix = "├─" if i < len(data["emails"]) - 1 else "└─"
+            result += f"{prefix} {email}\n"
+        result += "\n"
+    
+    if data.get("tg"):
+        result += "📱 TELEGRAM:\n"
+        for i, tg in enumerate(data["tg"]):
+            prefix = "├─" if i < len(data["tg"]) - 1 else "└─"
+            result += f"{prefix} {tg}\n"
+        result += "\n"
+    
+    if data.get("vk"):
+        result += "🎥 VK:\n"
+        for i, vk in enumerate(data["vk"]):
+            prefix = "├─" if i < len(data["vk"]) - 1 else "└─"
+            result += f"{prefix} {vk}\n"
+        result += "\n"
+    
+    if data.get("addresses"):
+        result += "📍 АДРЕСИ:\n"
+        for i, addr in enumerate(data["addresses"]):
+            prefix = "├─" if i < len(data["addresses"]) - 1 else "└─"
+            result += f"{prefix} {addr}\n"
+        result += "\n"
+    
+    if data.get("dates"):
+        result += "📅 ДАТИ:\n"
+        for i, date in enumerate(data["dates"][:5]):
+            prefix = "├─" if i < len(data["dates"][:5]) - 1 else "└─"
+            result += f"{prefix} {date}\n"
+        result += "\n"
+    
+    return result
+
+def format_yandex_result(orders, query, country_name):
+    if not orders:
+        return None
+    
+    result = f"🍔 РЕЗУЛЬТАТИ ПОШУКУ (ЯНДЕКС ЕДА)\n"
+    result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    result += f"📌 Запит: {query}\n\n"
+    
+    total_amount = 0
+    for i, order in enumerate(orders, 1):
+        result += f"📋 ЗАМОВЛЕННЯ №{i}:\n"
+        result += f"├─ 📞 Телефон: {order.get('phone', '❌')}\n"
+        result += f"├─ 👤 ПІБ: {order.get('name', '❌')}\n"
+        result += f"├─ 🏠 Адреса: {order.get('address', '❌')}\n"
+        result += f"├─ 📅 Дата: {order.get('date', '❌')}\n"
+        result += f"├─ 💰 Сума: {order.get('amount', '0')} руб\n"
+        result += f"└─ 🍽 Страви: {order.get('items', '❌')}\n\n"
+        try:
+            total_amount += int(order.get('amount', '0'))
+        except:
+            pass
+    
+    result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    result += f"💰 СУМАРНО: {len(orders)} замовлень на {total_amount} руб\n"
+    
+    if orders and orders[0].get('address'):
+        result += f"🏠 Адреса доставки: {orders[0]['address']}\n"
+    
+    return result
+
+def format_mvd_result(results, query):
+    result = f"🏛 РЕЗУЛЬТАТИ ПОШУКУ (МВД)\n"
+    result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    result += f"📌 Запит: {query}\n\n"
+    
+    for row in results[:5]:
+        if len(row) >= 4:
+            result += f"📋 ІНФОРМАЦІЯ ПРО ОСОБУ:\n"
+            result += f"├─ 👤 ПІБ: {row[1] if len(row) > 1 else '❌'}\n"
+            result += f"├─ 📅 Дата народження: {row[2] if len(row) > 2 else '❌'}\n"
+            result += f"├─ 🆔 Паспорт: {row[0]}\n"
+            status = "✅ Не в розшуку" if "не в розшуку" in row[3].lower() else f"⚠️ {row[3]}"
+            result += f"└─ ⚠️ Статус: {status}\n"
+            if len(row) > 4 and row[4]:
+                result += f"   📋 Стаття: {row[4]}\n"
+            result += "\n"
+    
+    return result
+
+def format_mts_result(cards, query):
+    if not cards:
+        return None
+    
+    result = f"🏦 РЕЗУЛЬТАТИ ПОШУКУ (МТС БАНК)\n"
+    result += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    result += f"📌 Запит: {query}\n\n"
+    
+    for card in cards[:5]:
+        result += f"📋 КАРТА:\n"
+        result += f"├─ 👤 ПІБ: {card.get('name', '❌')}\n"
+        result += f"├─ 📞 Телефон: {card.get('phone', '❌')}\n"
+        result += f"├─ 💳 Карта: {card.get('card', '❌')}\n"
+        result += f"├─ 📅 Термін: {card.get('expiry', '❌')}\n"
+        result += f"└─ 💰 Баланс: {card.get('balance', '0')} руб\n\n"
+    
+    return result
+
+def format_new_data(data):
+    if not data:
+        return None
+    
+    result = "🔄 **НОВІ ЗНАЙДЕНІ ДАНІ:**\n\n"
+    
+    if data.get("phones"):
+        result += "📞 Нові телефони:\n"
+        for phone in data["phones"][:10]:
+            result += f"├─ {phone}\n"
+        result += "\n"
+    
+    if data.get("names"):
+        result += "👤 Нові імена:\n"
+        for name in data["names"][:10]:
+            result += f"├─ {name}\n"
+        result += "\n"
+    
+    if data.get("emails"):
+        result += "📧 Нові email:\n"
+        for email in data["emails"][:5]:
+            result += f"├─ {email}\n"
+        result += "\n"
+    
+    if data.get("tg"):
+        result += "📱 Нові Telegram:\n"
+        for tg in data["tg"][:5]:
+            result += f"├─ {tg}\n"
+        result += "\n"
+    
+    if data.get("addresses"):
+        result += "📍 Нові адреси:\n"
+        for addr in data["addresses"][:5]:
+            result += f"├─ {addr}\n"
+    
+    return result
+
+async def ai_analysis(user_id, data):
+    if not ai_enabled:
+        return "❌ AI функції тимчасово недоступні"
+    
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ти експерт з OSINT аналізу. Аналізуй знайдені дані коротко українською."},
+                {"role": "user", "content": f"Проаналізуй ці OSINT дані та напиши короткий висновок (зв'язки, рекомендації):\n{data[:3000]}"}
+            ],
+            timeout=30
+        )
+        return f"🤖 ШТУЧНИЙ ІНТЕЛЕКТ (АНАЛІЗ)\n\n{response.choices[0].message.content}"
+    except Exception as e:
+        return f"❌ Помилка ШІ: {str(e)[:100]}"
+
+# =============== СТАНИ ===============
+class States(StatesGroup):
+    waiting_phone = State()
+    waiting_fio = State()
+    waiting_email = State()
+    waiting_tg = State()
+    waiting_vk = State()
+    waiting_yandex = State()
+    waiting_mts = State()
+    waiting_mvd = State()
+    waiting_iin = State()
+    waiting_promo = State()
+    waiting_text = State()
+    waiting_url = State()
+    waiting_dork = State()
+    waiting_continue = State()
+
+# =============== ОБРОБНИКИ ===============
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    if not get_user(user_id):
+        save_user(user_id)
+    await message.answer(get_text(user_id, "start"), reply_markup=country_keyboard(user_id))
+
+@dp.callback_query(lambda c: c.data == "back")
+async def back(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    await state.clear()
+    await callback.message.edit_text(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("country_"))
+async def select_country(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    country_code = callback.data.split("_")[1]
+    await state.update_data(country=country_code)
+    
+    if country_code in ["tg", "vk", "yandex_eda", "mts_bank", "mvd"]:
+        action_names = {
+            "tg": get_text(user_id, "search_tg"),
+            "vk": get_text(user_id, "search_vk"),
+            "yandex_eda": get_text(user_id, "search_yandex"),
+            "mts_bank": get_text(user_id, "search_mts"),
+            "mvd": get_text(user_id, "search_mvd")
+        }
+        action_callbacks = {
+            "tg": "action_tg", "vk": "action_vk", "yandex_eda": "action_yandex",
+            "mts_bank": "action_mts", "mvd": "action_mvd"
+        }
+        await callback.message.edit_text(f"{COUNTRIES[country_code]}\n\n{get_text(user_id, 'main_menu')}", 
+                                         reply_markup=special_action_keyboard(user_id, country_code, 
+                                         action_names.get(country_code, "Пошук"), action_callbacks.get(country_code, "action")))
+    else:
+        await callback.message.edit_text(f"{COUNTRIES[country_code]}\n\n{get_text(user_id, 'main_menu')}", 
+                                         reply_markup=action_keyboard(user_id, country_code))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("action_"))
+async def handle_action(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    parts = callback.data.split("_")
+    action = parts[1]
+    country = parts[2]
+    await state.update_data(country=country)
+    
+    prompts = {
+        "phone": get_text(user_id, "enter_phone"),
+        "fio": get_text(user_id, "enter_fio"),
+        "email": get_text(user_id, "enter_email"),
+        "tg": get_text(user_id, "enter_tg"),
+        "vk": get_text(user_id, "enter_vk"),
+        "yandex": get_text(user_id, "enter_yandex"),
+        "mts": get_text(user_id, "enter_mts"),
+        "mvd": get_text(user_id, "enter_mvd")
+    }
+    
+    if action in prompts:
+        await callback.message.edit_text(prompts[action])
+        await state.set_state(getattr(States, f"waiting_{action}", States.waiting_phone))
+        await state.update_data(search_type=action)
+    elif action == "deep":
+        if not check_promo(user_id):
+            await callback.message.edit_text(get_text(user_id, "promo_required"))
+            await state.set_state(States.waiting_promo)
+            await state.update_data(next_action="deep")
+        else:
+            await callback.message.edit_text(get_text(user_id, "enter_phone") + "\n\n(або ФІО чи Email)")
+            await state.set_state(States.waiting_phone)
+            await state.update_data(deep_mode=True, search_type="deep")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("tool_"))
+async def handle_tools(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    tool = callback.data.split("_")[1]
+    
+    if tool == "analyze":
+        await callback.message.edit_text(get_text(user_id, "enter_phone"))
+        await state.set_state(States.waiting_phone)
+        await state.update_data(tool="analyze")
+    elif tool == "iin":
+        await callback.message.edit_text(get_text(user_id, "enter_iin"))
+        await state.set_state(States.waiting_iin)
+    elif tool == "dork":
+        await callback.message.edit_text("🔎 Google Dork\n\nВиберіть тип:", reply_markup=dork_menu())
+    elif tool == "webarchive":
+        await callback.message.edit_text(get_text(user_id, "enter_url"))
+        await state.set_state(States.waiting_url)
+    elif tool == "factcheck":
+        if not ai_enabled:
+            await callback.message.edit_text("❌ AI тимчасово недоступний")
+        else:
+            await callback.message.edit_text(get_text(user_id, "enter_text"))
+            await state.set_state(States.waiting_text)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("dork_"))
+async def handle_dork(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    dork_type = callback.data.split("_")[1]
+    await state.update_data(dork_type=dork_type)
+    
+    prompts = {"person": "👤 Введіть username:", "email": "📧 Введіть email:", "docs": "📂 Введіть слово:",
+               "admin": "💀 Введіть сайт:", "secret": "🔐 Введіть сайт:"}
+    await callback.message.edit_text(prompts.get(dork_type, "Введіть запит:"))
+    await state.set_state(States.waiting_dork)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data in ["continue_yes", "continue_no"])
+async def handle_continue(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    data = await state.get_data()
+    
+    if callback.data == "continue_yes":
+        country = data.get("last_country")
+        existing_data = data.get("last_formatted_data", {})
+        
+        if not country or not existing_data:
+            await callback.message.answer("❌ Немає даних для продовження пошуку")
+            await state.clear()
+            await callback.message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+            await callback.answer()
+            return
+        
+        phones_str = ", ".join(existing_data.get("phones", [])[:3]) or "немає"
+        names_str = ", ".join(existing_data.get("names", [])[:3]) or "немає"
+        emails_str = ", ".join(existing_data.get("emails", [])[:3]) or "немає"
+        
+        await callback.message.answer(get_text(user_id, "recursive_searching", 
+            phones=phones_str, names=names_str, emails=emails_str))
+        
+        # Шукаємо НОВІ дані на основі знайдених телефонів та імен
+        new_results = await asyncio.to_thread(
+            searcher.recursive_continue_search, 
+            country, existing_data, 30
+        )
+        
+        if new_results:
+            # Виводимо тільки нові, раніше не знайдені дані
+            old_phones = set(existing_data.get("phones", []))
+            old_names = set(existing_data.get("names", []))
+            old_emails = set(existing_data.get("emails", []))
+            old_tg = set(existing_data.get("tg", []))
+            old_addresses = set(existing_data.get("addresses", []))
+            
+            new_results["phones"] = [p for p in new_results.get("phones", []) if p not in old_phones]
+            new_results["names"] = [n for n in new_results.get("names", []) if n not in old_names]
+            new_results["emails"] = [e for e in new_results.get("emails", []) if e not in old_emails]
+            new_results["tg"] = [t for t in new_results.get("tg", []) if t not in old_tg]
+            new_results["addresses"] = [a for a in new_results.get("addresses", []) if a not in old_addresses]
+            
+            has_new = (new_results.get("phones") or new_results.get("names") or 
+                      new_results.get("emails") or new_results.get("tg") or new_results.get("addresses"))
+            
+            if has_new:
+                result_text = format_new_data(new_results)
+                await callback.message.answer(result_text[:4000])
+                
+                # Оновлюємо дані для наступного продовження
+                combined_data = existing_data.copy()
+                combined_data["phones"] = list(set(combined_data.get("phones", []) + new_results.get("phones", [])))
+                combined_data["names"] = list(set(combined_data.get("names", []) + new_results.get("names", [])))
+                combined_data["emails"] = list(set(combined_data.get("emails", []) + new_results.get("emails", [])))
+                combined_data["tg"] = list(set(combined_data.get("tg", []) + new_results.get("tg", [])))
+                combined_data["addresses"] = list(set(combined_data.get("addresses", []) + new_results.get("addresses", [])))
+                await state.update_data(last_formatted_data=combined_data)
+            else:
+                await callback.message.answer(get_text(user_id, "no_new_data"))
+        else:
+            await callback.message.answer(get_text(user_id, "no_new_data"))
+        
+        await callback.message.answer(get_text(user_id, "continue_search"), reply_markup=continue_keyboard(user_id))
+    else:
+        await state.clear()
+        await callback.message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+    
+    await callback.answer()
+
+async def process_search_results(message, user_id, results, query, country, search_type, state):
+    country_name = COUNTRIES.get(country, country)
+    
+    if not results:
+        await message.answer(get_text(user_id, "not_found"))
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+        return
+    
+    inc_search(user_id)
+    add_history(user_id, query, search_type, country, len(results))
+    
+    if search_type == "yandex_eda":
+        formatted_data = searcher.format_results(results, "yandex_eda")
+        result_text = format_yandex_result(formatted_data.get("orders", []), query, country_name)
+    elif search_type == "mts_bank":
+        formatted_data = searcher.format_results(results, "mts_bank")
+        result_text = format_mts_result(formatted_data.get("cards", []), query)
+    elif search_type == "mvd":
+        result_text = format_mvd_result(results, query)
+        formatted_data = searcher.format_results(results, "mvd")
+    else:
+        formatted_data = searcher.format_results(results, search_type)
+        result_text = format_main_result(formatted_data, query, country_name)
+    
+    if result_text:
+        await message.answer(result_text[:4000])
+    
+    # ШІ-аналіз
+    if ai_enabled:
+        await message.answer(get_text(user_id, "ai_analyze"))
+        ai_result = await ai_analysis(user_id, result_text[:3000] if result_text else "")
+        await message.answer(ai_result[:4000])
+    
+    # Зберігаємо дані для продовження пошуку
+    if formatted_data:
+        await state.update_data(last_query=query, last_country=country, 
+                               last_search_type=search_type, last_formatted_data=formatted_data)
+        await message.answer(get_text(user_id, "continue_search"), reply_markup=continue_keyboard(user_id))
+        await state.set_state(States.waiting_continue)
+    else:
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+# =============== ОСНОВНІ ОБРОБНИКИ ПОШУКУ ===============
+@dp.message(States.waiting_phone)
+async def search_phone(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    country = data.get("country")
+    tool = data.get("tool")
+    deep_mode = data.get("deep_mode", False)
+    search_type = data.get("search_type", "phone")
+    
+    if tool == "analyze":
+        try:
+            parsed = phonenumbers.parse(query, None)
+            if phonenumbers.is_valid_number(parsed):
+                country_name = geocoder.description_for_number(parsed, "ru")
+                operator = carrier.name_for_number(parsed, "ru")
+                await message.answer(f"📊 **Аналіз номера**\n\n📞 Номер: {query}\n🌍 Країна: {country_name}\n📡 Оператор: {operator or 'Не визначено'}\n✅ Статус: Валідний")
+            else:
+                await message.answer("❌ Невірний формат номера")
+        except Exception as e:
+            await message.answer(f"❌ Помилка: {str(e)[:100]}")
+        await state.clear()
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+        return
+    
+    if not country:
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+        await state.clear()
+        return
+    
+    await message.answer(get_text(user_id, "searching", query=query, country=COUNTRIES.get(country, country)))
+    
+    results = await asyncio.to_thread(searcher.search_country, country, query, search_type)
+    await process_search_results(message, user_id, results, query, country, search_type, state)
+
+@dp.message(States.waiting_fio)
+async def search_fio(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    country = data.get("country")
+    search_type = data.get("search_type", "name")
+    
+    if not country:
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+        await state.clear()
+        return
+    
+    await message.answer(get_text(user_id, "searching", query=query, country=COUNTRIES.get(country, country)))
+    results = await asyncio.to_thread(searcher.search_country, country, query, search_type)
+    await process_search_results(message, user_id, results, query, country, search_type, state)
+
+@dp.message(States.waiting_email)
+async def search_email(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip().lower()
+    data = await state.get_data()
+    country = data.get("country")
+    
+    if not country:
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+        await state.clear()
+        return
+    
+    await message.answer(get_text(user_id, "searching", query=query, country=COUNTRIES.get(country, country)))
+    results = await asyncio.to_thread(searcher.search_country, country, query, "email")
+    await process_search_results(message, user_id, results, query, country, "email", state)
+
+@dp.message(States.waiting_tg)
+async def search_tg(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip().replace('@', '')
+    data = await state.get_data()
+    country = data.get("country", "tg")
+    
+    await message.answer(get_text(user_id, "searching", query=f"@{query}", country=COUNTRIES.get(country, country)))
+    results = await asyncio.to_thread(searcher.search_country, country, query, "tg")
+    await process_search_results(message, user_id, results, f"@{query}", country, "tg", state)
+
+@dp.message(States.waiting_vk)
+async def search_vk(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    country = data.get("country", "vk")
+    
+    await message.answer(get_text(user_id, "searching", query=query, country=COUNTRIES.get(country, country)))
+    results = await asyncio.to_thread(searcher.search_country, country, query, "vk")
+    await process_search_results(message, user_id, results, query, country, "vk", state)
+
+@dp.message(States.waiting_yandex)
+async def search_yandex(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    country = data.get("country", "yandex_eda")
+    
+    await message.answer(get_text(user_id, "searching", query=query, country=COUNTRIES.get(country, country)))
+    results = await asyncio.to_thread(searcher.search_country, country, query, "phone")
+    await process_search_results(message, user_id, results, query, country, "yandex_eda", state)
+
+@dp.message(States.waiting_mts)
+async def search_mts(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    country = data.get("country", "mts_bank")
+    
+    await message.answer(get_text(user_id, "searching", query=query, country=COUNTRIES.get(country, country)))
+    results = await asyncio.to_thread(searcher.search_country, country, query, "phone")
+    await process_search_results(message, user_id, results, query, country, "mts_bank", state)
+
+@dp.message(States.waiting_mvd)
+async def search_mvd(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    country = data.get("country", "mvd")
+    
+    await message.answer(get_text(user_id, "searching", query=query, country=COUNTRIES.get(country, country)))
+    results = await asyncio.to_thread(searcher.search_country, country, query, "name")
+    await process_search_results(message, user_id, results, query, country, "mvd", state)
+
+@dp.message(States.waiting_iin)
+async def analyze_iin(message: types.Message, state: States):
+    user_id = message.from_user.id
+    iin = message.text.strip().replace(" ", "").replace("-", "")
+    
+    result = searcher.analyze_iin(iin)
+    
+    if result:
+        await message.answer(get_text(user_id, "iin_analysis",
+            iin=result["iin"], birth_date=result["birth_date"],
+            gender=result["gender"], region=result["region"], extra=result["extra"]))
+    else:
+        await message.answer("❌ Невірний формат ІІН (потрібно 12 цифр)")
+    
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+@dp.message(States.waiting_dork)
+async def process_dork(message: types.Message, state: States):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    data = await state.get_data()
+    dork_type = data.get("dork_type", "person")
+    
+    templates = {
+        "person": [f'"{query}" site:instagram.com', f'"{query}" site:t.me'],
+        "email": [f'"{query}" filetype:pdf'],
+        "docs": [f'filetype:pdf "{query}"'],
+        "admin": [f'site:{query} inurl:admin'],
+        "secret": [f'site:{query} filetype:env']
+    }
+    dorks = templates.get(dork_type, [])
+    result_text = f"🔎 Google Dork для {query}\n\n" + "\n".join([f"• {d}" for d in dorks])
+    
+    await message.answer(result_text[:4000])
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+@dp.message(States.waiting_url)
+async def process_webarchive(message: types.Message, state: States):
+    user_id = message.from_user.id
+    url = message.text.strip()
+    await message.answer("📁 Шукаю архівні копії...")
+    try:
+        encoded = urllib.parse.quote(url, safe='')
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://archive.org/wayback/available?url={encoded}", timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("archived_snapshots"):
+                        snapshot = data["archived_snapshots"]["closest"]
+                        await message.answer(f"📁 Архівна копія:\n{snapshot.get('url', 'немає')}")
+                    else:
+                        await message.answer("❌ Архівних копій не знайдено")
+                else:
+                    await message.answer("❌ Помилка при зверненні до архіву")
+    except Exception as e:
+        await message.answer(f"❌ Помилка: {str(e)[:100]}")
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+@dp.message(States.waiting_text)
+async def process_factcheck(message: types.Message, state: States):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    if len(text) < 10:
+        await message.answer("❌ Занадто короткий текст (мінімум 10 символів)")
+    else:
+        await message.answer(get_text(user_id, "ai_analyze"))
+        try:
+            response = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Ти експерт з перевірки фактів. Відповідай коротко українською."},
+                    {"role": "user", "content": f"Перевір цей факт:\n{text}"}
+                ],
+                timeout=30
+            )
+            await message.answer(f"✅ Результат перевірки:\n\n{response.choices[0].message.content}")
+        except Exception as e:
+            await message.answer(f"❌ Помилка ШІ: {str(e)[:100]}")
+    await state.clear()
+    await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+@dp.message(States.waiting_promo)
+async def process_promo(message: types.Message, state: States):
+    user_id = message.from_user.id
+    code = message.text.strip().upper()
+    data = await state.get_data()
+    next_action = data.get("next_action")
+    country = data.get("country")
+    
+    if code in promocodes and not promocodes[code]["used"]:
+        promocodes[code]["used"] = True
+        save_promocodes(promocodes)
+        update_promo(user_id, code)
+        await message.answer(get_text(user_id, "promo_activated"))
+        
+        if next_action == "deep":
+            await message.answer(get_text(user_id, "enter_phone") + "\n\n(або ФІО чи Email)")
+            await state.set_state(States.waiting_phone)
+            await state.update_data(country=country, deep_mode=True, search_type="deep")
+        else:
+            await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+            await state.clear()
+    else:
+        await message.answer(get_text(user_id, "promo_invalid"))
+        await state.clear()
+        await message.answer(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+
+@dp.callback_query(lambda c: c.data == "promo")
+async def promo_start(callback: types.CallbackQuery, state: States):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(get_text(user_id, "enter_promo"))
+    await state.set_state(States.waiting_promo)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "lang")
+async def lang_start(callback: types.CallbackQuery):
+    await callback.message.edit_text("🌍 Оберіть мову / Выберите язык:", reply_markup=lang_menu())
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("lang_"))
+async def set_lang(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    lang = callback.data.split("_")[1]
+    save_user(user_id, lang)
+    await callback.message.edit_text(get_text(user_id, "main_menu"), reply_markup=country_keyboard(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "info")
+async def show_info(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user = get_user(user_id)
+    
+    stats_lines = []
+    total_files = 0
+    for code, name in COUNTRIES.items():
+        folder = os.path.join(DATABASES_DIR, code)
+        if os.path.exists(folder):
+            files = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f)) and f not in ['.DS_Store', 'Thumbs.db']]
+            total_files += len(files)
+            stats_lines.append(f"   {name}: {len(files)} файлів")
+    stats_text = "\n".join(stats_lines) if stats_lines else "   Немає файлів"
+    
+    info_text = f"""🤖 **OSINT Power Bot v12.0**
+
+🔍 **МОЖЛИВОСТІ:**
+• 📞 Пошук за номером телефону
+• 👤 Пошук за ФІО
+• 📧 Пошук за Email
+• 📱 Пошук за Telegram
+• 🎥 Пошук за VK
+• 🍔 Пошук за Яндекс Еда
+• 🏦 Пошук за МТС Банк
+• 🏛 Пошук за МВД
+• 🆔 Аналіз ІІН
+• 🔄 Глибокий рекурсивний пошук
+• 📊 Аналіз номера
+• 🔎 Google Dork
+• 📁 WebArchive
+• ✅ Перевірка фактів через ШІ
+
+📊 **СТАТИСТИКА БАЗ ДАНИХ:**
+{stats_text}
+
+📁 **Всього файлів:** {total_files}
+🔍 **Ваших пошуків:** {user['search_count'] if user else 0}
+🎟️ **Промокод:** {'Активний' if check_promo(user_id) else 'Немає'}
+
+💡 **Команди:**
+/start - Головне меню
+
+⚠️ Дані з відкритих джерел"""
+    
+    await callback.message.edit_text(info_text, reply_markup=country_keyboard(user_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "history")
+async def show_history(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    conn = sqlite3.connect(USERS_DB)
+    cursor = conn.cursor()
+    cursor.execute("SELECT query, query_type, country, result_count, search_date FROM search_history WHERE user_id = ? ORDER BY search_date DESC LIMIT 15", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if rows:
+        text = "📜 **ОСТАННІ ПОШУКИ:**\n\n"
+        for r in rows:
+            country_name = COUNTRIES.get(r[2], r[2])
+            date = datetime.fromisoformat(r[4]).strftime("%d.%m %H:%M")
+            text += f"• `{r[0]}`\n  {country_name} | {r[1]} | {r[3]} знайдено | {date}\n\n"
+        await callback.message.edit_text(text, reply_markup=country_keyboard(user_id))
+    else:
+        await callback.message.edit_text("📜 Історія пошуків порожня", reply_markup=country_keyboard(user_id))
+    await callback.answer()
+
+# =============== ЗАПУСК ===============
+async def main():
+    print("=" * 60)
+    print("🤖 OSINT Power Bot v12.0 - ПОТУЖНИЙ ПОШУКОВИЙ БОТ")
+    print("=" * 60)
+    print("📁 Папка з базами: database/")
+    print("-" * 60)
+    print("📂 Доступні бази даних:")
+    
+    for code, name in COUNTRIES.items():
+        folder = os.path.join(DATABASES_DIR, code)
+        if os.path.exists(folder):
+            files = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f)) and f not in ['.DS_Store', 'Thumbs.db']]
+            print(f"   {name}: {len(files)} файлів")
+        else:
+            print(f"   {name}: папка створена")
+    
+    print("-" * 60)
+    print(f"✅ AI статус: {'Активовано' if ai_enabled else 'Вимкнено'}")
+    print(f"📋 Промокодів: {len(promocodes)}")
+    print("=" * 60)
+    print("✅ Бот запущено та готовий до роботи!")
+    print("⚡ Бази даних завантажуються ТІЛЬКИ під час пошуку")
+    print("=" * 60)
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
