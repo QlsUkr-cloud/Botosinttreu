@@ -1,0 +1,366 @@
+import logging
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+
+API_TOKEN = "YOUR_BOT_TOKEN"
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# ==================== КЛАВІАТУРИ ====================
+
+main_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📇 Пошук за номером"), KeyboardButton(text="👤 Пошук за ФІО")],
+        [KeyboardButton(text="📧 Пошук за Email"), KeyboardButton(text="📱 Пошук за Telegram")],
+        [KeyboardButton(text="🏠 Пошук за адресою"), KeyboardButton(text="🎵 Пошук за TikTok")],
+        [KeyboardButton(text="🌐 Пошук за IP"), KeyboardButton(text="🚗 Пошук за авто")],
+        [KeyboardButton(text="🆔 Пошук за ІІН"), KeyboardButton(text="🪪 Паспорт РФ")],
+        [KeyboardButton(text="🔁 Рекурсивний пошук"), KeyboardButton(text="📋 Розширений пошук")],
+        [KeyboardButton(text="🌐 Google Dorks"), KeyboardButton(text="📦 Web Archive")],
+        [KeyboardButton(text="🕵️ Whois"), KeyboardButton(text="📡 Subdomains")]
+    ],
+    resize_keyboard=True
+)
+
+country_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🇷🇺 Росія"), KeyboardButton(text="🇺🇦 Україна")],
+        [KeyboardButton(text="🇰🇿 Казахстан"), KeyboardButton(text="🇧🇾 Білорусь")],
+        [KeyboardButton(text="🇲🇩 Молдова"), KeyboardButton(text="🌍 Gmail")],
+        [KeyboardButton(text="🎵 TikTok"), KeyboardButton(text="🏠 Адреси")],
+        [KeyboardButton(text="🔙 Назад")]
+    ],
+    resize_keyboard=True
+)
+
+dorks_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔍 Пошук за email"), KeyboardButton(text="🌍 Пошук за сайтом (site:)")],
+        [KeyboardButton(text="📄 Пошук за файлом"), KeyboardButton(text="🔑 Логіни/паролі")],
+        [KeyboardButton(text="📁 Відкриті директорії"), KeyboardButton(text="👤 Пошук за ПІБ/номером")],
+        [KeyboardButton(text="✏️ Ввести свій dork"), KeyboardButton(text="🔙 Назад")]
+    ],
+    resize_keyboard=True
+)
+
+# ==================== СТАНИ ====================
+
+class SearchStates(StatesGroup):
+    waiting_phone = State()
+    waiting_fio = State()
+    waiting_email = State()
+    waiting_tg = State()
+    waiting_address = State()
+    waiting_tiktok = State()
+    waiting_ip = State()
+    waiting_car = State()
+    waiting_iin = State()
+    waiting_passport = State()
+    waiting_recursive_phone = State()
+    waiting_country = State()
+    waiting_dork_input = State()
+    waiting_webarchive_url = State()
+    waiting_whois_domain = State()
+    waiting_subdomain_domain = State()
+    extended_form = State()
+
+# ==================== ГОЛОВНЕ МЕНЮ ====================
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("🔍 Osint Bot готовий до роботи. Оберіть дію:", reply_markup=main_menu)
+
+@dp.message(F.text == "🔙 Назад")
+async def back_to_main(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🔙 Головне меню:", reply_markup=main_menu)
+
+# ==================== ВИБІР БАЗИ ====================
+
+async def ask_country(message: types.Message, state: FSMContext, search_type: str, value: str):
+    await state.update_data(search_type=search_type, search_value=value)
+    await message.answer("Оберіть базу для пошуку:", reply_markup=country_menu)
+    await state.set_state(SearchStates.waiting_country)
+
+@dp.message(SearchStates.waiting_country)
+async def process_country(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await back_to_main(message, state)
+        return
+    data = await state.get_data()
+    await message.answer(
+        f"🔍 Результат пошуку\nТип: {data.get('search_type')}\nЗапит: {data.get('search_value')}\nБаза: {message.text}\n(заглушка)",
+        reply_markup=main_menu
+    )
+    await state.clear()
+
+# ==================== ОСНОВНІ ПОШУКИ ====================
+
+@dp.message(F.text == "📇 Пошук за номером")
+async def search_phone(message: types.Message, state: FSMContext):
+    await message.answer("📞 Введіть номер:", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(SearchStates.waiting_phone)
+
+@dp.message(SearchStates.waiting_phone)
+async def get_phone(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "phone", message.text.strip())
+
+@dp.message(F.text == "👤 Пошук за ФІО")
+async def search_fio(message: types.Message, state: FSMContext):
+    await message.answer("👤 Введіть ПІБ:")
+    await state.set_state(SearchStates.waiting_fio)
+
+@dp.message(SearchStates.waiting_fio)
+async def get_fio(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "fio", message.text.strip())
+
+@dp.message(F.text == "📧 Пошук за Email")
+async def search_email(message: types.Message, state: FSMContext):
+    await message.answer("📧 Введіть Email:")
+    await state.set_state(SearchStates.waiting_email)
+
+@dp.message(SearchStates.waiting_email)
+async def get_email(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "email", message.text.strip())
+
+@dp.message(F.text == "📱 Пошук за Telegram")
+async def search_tg(message: types.Message, state: FSMContext):
+    await message.answer("📱 Введіть Telegram username:")
+    await state.set_state(SearchStates.waiting_tg)
+
+@dp.message(SearchStates.waiting_tg)
+async def get_tg(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "telegram", message.text.strip())
+
+@dp.message(F.text == "🏠 Пошук за адресою")
+async def search_address(message: types.Message, state: FSMContext):
+    await message.answer("🏠 Введіть адресу:")
+    await state.set_state(SearchStates.waiting_address)
+
+@dp.message(SearchStates.waiting_address)
+async def get_address(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "address", message.text.strip())
+
+@dp.message(F.text == "🎵 Пошук за TikTok")
+async def search_tiktok(message: types.Message, state: FSMContext):
+    await message.answer("🎵 Введіть TikTok username:")
+    await state.set_state(SearchStates.waiting_tiktok)
+
+@dp.message(SearchStates.waiting_tiktok)
+async def get_tiktok(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "tiktok", message.text.strip())
+
+@dp.message(F.text == "🌐 Пошук за IP")
+async def search_ip(message: types.Message, state: FSMContext):
+    await message.answer("🌐 Введіть IP-адресу:")
+    await state.set_state(SearchStates.waiting_ip)
+
+@dp.message(SearchStates.waiting_ip)
+async def get_ip(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "ip", message.text.strip())
+
+@dp.message(F.text == "🚗 Пошук за авто")
+async def search_car(message: types.Message, state: FSMContext):
+    await message.answer("🚗 Введіть номер авто або VIN:")
+    await state.set_state(SearchStates.waiting_car)
+
+@dp.message(SearchStates.waiting_car)
+async def get_car(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "car", message.text.strip())
+
+@dp.message(F.text == "🆔 Пошук за ІІН")
+async def search_iin(message: types.Message, state: FSMContext):
+    await message.answer("🆔 Введіть ІІН (12 цифр):")
+    await state.set_state(SearchStates.waiting_iin)
+
+@dp.message(SearchStates.waiting_iin)
+async def get_iin(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "iin", message.text.strip())
+
+@dp.message(F.text == "🪪 Паспорт РФ")
+async def search_passport(message: types.Message, state: FSMContext):
+    await message.answer("🪪 Введіть серію та номер паспорта РФ:")
+    await state.set_state(SearchStates.waiting_passport)
+
+@dp.message(SearchStates.waiting_passport)
+async def get_passport(message: types.Message, state: FSMContext):
+    await ask_country(message, state, "passport", message.text.strip())
+
+# ==================== РЕКУРСИВНИЙ ПОШУК ====================
+
+@dp.message(F.text == "🔁 Рекурсивний пошук")
+async def recursive_search(message: types.Message, state: FSMContext):
+    await message.answer("📞 Введіть номер телефону для рекурсивного пошуку:")
+    await state.set_state(SearchStates.waiting_recursive_phone)
+
+@dp.message(SearchStates.waiting_recursive_phone)
+async def do_recursive(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    result = f"""📌 Знайдено за номером: {phone}
+├─ ФІО: Глазунова Елена Викторовна
+├─ Також: Козлова Татьяна Константиновна, Михаил
+├─ Регіон: Yaroslav_area
+
+🔁 Рекурсивний пошук за ФІО:
+├─ Email: glazunova@example.com
+├─ Telegram: @glazunova_e
+├─ TikTok: @glazunova_e
+├─ IP: 192.168.1.1
+├─ Авто: Toyota Camry
+├─ ІІН: 123456789012
+├─ Паспорт РФ: 1234 567890
+└─ Адреса: м. Ярославль, вул. Прикладная, 1"""
+    await message.answer(result, reply_markup=main_menu)
+    await state.clear()
+
+# ==================== GOOGLE DORKS ====================
+
+@dp.message(F.text == "🌐 Google Dorks")
+async def google_dorks_menu(message: types.Message, state: FSMContext):
+    await message.answer("🌐 GOOGLE DORKS\nОберіть тип пошуку:", reply_markup=dorks_menu)
+    await state.set_state(None)
+
+@dp.message(F.text == "✏️ Ввести свій dork")
+async def custom_dork(message: types.Message, state: FSMContext):
+    await message.answer("✏️ Введіть ваш Google Dork:\nНаприклад: site:example.com intitle:admin")
+    await state.set_state(SearchStates.waiting_dork_input)
+
+@dp.message(SearchStates.waiting_dork_input)
+async def process_custom_dork(message: types.Message, state: FSMContext):
+    dork = message.text.strip()
+    await message.answer(f"🔍 Google Dork: {dork}\n🔗 Посилання: https://www.google.com/search?q={dork.replace(' ', '+')}\n(заглушка)", reply_markup=main_menu)
+    await state.clear()
+
+@dp.message(F.text.in_({"🔍 Пошук за email", "🌍 Пошук за сайтом (site:)", "📄 Пошук за файлом", "🔑 Логіни/паролі", "📁 Відкриті директорії", "👤 Пошук за ПІБ/номером"}))
+async def preset_dork(message: types.Message, state: FSMContext):
+    dorks = {
+        "🔍 Пошук за email": '"@gmail.com" | "@mail.ru" | "@ukr.net"',
+        "🌍 Пошук за сайтом (site:)": "site:example.com",
+        "📄 Пошук за файлом": 'filetype:pdf "confidential"',
+        "🔑 Логіни/паролі": 'inurl:login | inurl:admin',
+        "📁 Відкриті директорії": 'intitle:"index of"',
+        "👤 Пошук за ПІБ/номером": '"Іванов" | "8900"'
+    }
+    dork = dorks.get(message.text, "")
+    await message.answer(f"🔍 Шаблон: {dork}\n🔗 https://www.google.com/search?q={dork.replace(' ', '+')}\n(заглушка)", reply_markup=main_menu)
+
+# ==================== WEB ARCHIVE ====================
+
+@dp.message(F.text == "📦 Web Archive")
+async def webarchive_menu(message: types.Message, state: FSMContext):
+    await message.answer("📦 Введіть URL сайту (наприклад, example.com або https://example.com):")
+    await state.set_state(SearchStates.waiting_webarchive_url)
+
+@dp.message(SearchStates.waiting_webarchive_url)
+async def webarchive_result(message: types.Message, state: FSMContext):
+    url = message.text.strip().replace("https://", "").replace("http://", "").split("/")[0]
+    result = f"""📦 WEB ARCHIVE: {url}
+
+💾 Збережень: 147
+📅 Перше: 2015-03-12
+📅 Останнє: 2024-12-01
+
+🔗 Посилання:
+https://web.archive.org/web/*/{url}"""
+    await message.answer(result, reply_markup=main_menu)
+    await state.clear()
+
+# ==================== WHOIS ====================
+
+@dp.message(F.text == "🕵️ Whois")
+async def whois_menu(message: types.Message, state: FSMContext):
+    await message.answer("🕵️ Введіть домен (наприклад, google.com):")
+    await state.set_state(SearchStates.waiting_whois_domain)
+
+@dp.message(SearchStates.waiting_whois_domain)
+async def whois_result(message: types.Message, state: FSMContext):
+    domain = message.text.strip()
+    result = f"""🕵️ WHOIS: {domain}
+
+📋 Реєстратор: NameCheap, Inc.
+📅 Створено: 2010-01-01
+📅 Оновлено: 2024-01-01
+📅 Закінчується: 2026-01-01
+👤 Власник: Private Registration
+📍 Країна: US
+📧 Email: admin@{domain}
+🌐 NS: ns1.{domain}, ns2.{domain}"""
+    await message.answer(result, reply_markup=main_menu)
+    await state.clear()
+
+# ==================== SUBDOMAINS ====================
+
+@dp.message(F.text == "📡 Subdomains")
+async def subdomain_menu(message: types.Message, state: FSMContext):
+    await message.answer("📡 Введіть домен для пошуку піддоменів:")
+    await state.set_state(SearchStates.waiting_subdomain_domain)
+
+@dp.message(SearchStates.waiting_subdomain_domain)
+async def subdomain_result(message: types.Message, state: FSMContext):
+    domain = message.text.strip()
+    result = f"""📡 ПІДДОМЕНИ: {domain}
+
+Знайдено 8 піддоменів:
+├─ mail.{domain}
+├─ admin.{domain}
+├─ api.{domain}
+├─ cdn.{domain}
+├─ dev.{domain}
+├─ test.{domain}
+├─ ftp.{domain}
+└─ vpn.{domain}"""
+    await message.answer(result, reply_markup=main_menu)
+    await state.clear()
+
+# ==================== РОЗШИРЕНИЙ ПОШУК ====================
+
+@dp.message(F.text == "📋 Розширений пошук")
+async def extended_search_form(message: types.Message, state: FSMContext):
+    await message.answer(
+        "📋 РОЗШИРЕНИЙ ПОШУК (OsintBot)\n\n"
+        "Надішліть дані у форматі:\n"
+        "Прізвище: Іванов\n"
+        "Ім'я: Іван\n"
+        "По батькові: Іванович\n"
+        "День: 15\n"
+        "Місяць: 05\n"
+        "Рік: 1990\n"
+        "Вік від: 30\n"
+        "Вік до: 40\n"
+        "Місце народження: Київ\n"
+        "Місто: Харків\n"
+        "Додатково: будь-яка інформація\n\n"
+        "Або натисніть /skip для пропуску поля"
+    )
+    await state.set_state(SearchStates.extended_form)
+
+@dp.message(SearchStates.extended_form)
+async def process_extended(message: types.Message, state: FSMContext):
+    data = message.text
+    # Тут можна парсити рядок
+    await message.answer(
+        "🔍 РЕЗУЛЬТАТ РОЗШИРЕНОГО ПОШУКУ\n\n"
+        "Знайдено збіги в базах:\n"
+        "├─ Росія: 3 записи\n"
+        "├─ Україна: 1 запис\n"
+        "└─ Gmail: 2 записи\n\n"
+        "(заглушка — реальний пошук потребує API)",
+        reply_markup=main_menu
+    )
+    await state.clear()
+
+# ==================== ЗАПУСК ====================
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
